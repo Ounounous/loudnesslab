@@ -88,9 +88,14 @@ def lra(z, a, b):
 
 def refinar_corte(mom, b, ventana):
     """Busca el punto más silencioso cerca del cambio reportado (el aviso de Windows llega con retraso).
-    Solo mueve el corte si hay una caída clara (>= 6 LU bajo la mediana de la zona)."""
+    Solo mueve el corte si hay una caída clara (>= 6 LU bajo la mediana de la zona).
+
+    Todo lo que está bajo el gate absoluto cuenta como el mismo silencio, y gana el primer bloque
+    de silencio. Sin eso, el desempate dentro de un silencio dependía del ruido de redondeo (la
+    cola del filtro K mide 1e-20 o 1e-18 según cómo se acumulen las sumas) y el corte caía en
+    bloques distintos en vivo y en el análisis."""
     a0, b0 = max(0, b - ventana), min(len(mom), b + ventana)
-    zona = mom[a0:b0]
+    zona = np.maximum(mom[a0:b0], ABS_GATE)
     if not len(zona) or np.all(np.isnan(zona)):
         return b, False
     i = int(np.nanargmin(zona))
