@@ -1,0 +1,9 @@
+PyAudioWPatch
+soundfile
+numpy
+scipy
+matplotlib
+winrt-runtime
+winrt-Windows.Media.Control
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
