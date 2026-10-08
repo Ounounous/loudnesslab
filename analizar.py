@@ -25,43 +25,11 @@ import sys
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import resample_poly, sosfilt
 
-ABS_GATE = -70.0
-SILENCIO = -60.0  # bajo esto, una ventana short-term se considera silencio/pausa
-
-
-# ----------------------------------------------------------------------------
-# BS.1770: filtro K (coeficientes exactos para cualquier sample rate)
-# ----------------------------------------------------------------------------
-def filtro_k(sr):
-    f0, G, Q = 1681.974450955533, 3.999843853973347, 0.7071752369554196
-    K = np.tan(np.pi * f0 / sr)
-    Vh = 10 ** (G / 20)
-    Vb = Vh ** 0.4996667741545416
-    a0 = 1 + K / Q + K * K
-    s1 = [(Vh + Vb * K / Q + K * K) / a0, 2 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0,
-          1.0, 2 * (K * K - 1) / a0, (1 - K / Q + K * K) / a0]
-    f0, Q = 38.13547087602444, 0.5003270373238773
-    K = np.tan(np.pi * f0 / sr)
-    a0 = 1 + K / Q + K * K
-    s2 = [1.0, -2.0, 1.0, 1.0, 2 * (K * K - 1) / a0, (1 - K / Q + K * K) / a0]
-    return np.array([s1, s2])
-
-
-def lufs(z):
-    z = np.asarray(z, dtype=float)
-    with np.errstate(divide="ignore"):
-        return -0.691 + 10 * np.log10(np.maximum(z, 1e-20))
-
-
-def media_movil(x, n):
-    """Promedio de las últimas n posiciones (incluida la actual); NaN donde no hay n valores."""
-    c = np.concatenate([[0.0], np.cumsum(x)])
-    out = np.full(len(x), np.nan)
-    if len(x) >= n:
-        out[n - 1:] = (c[n:] - c[:-n]) / n
-    return out
+# La medición vive en un módulo compartido con el medidor en vivo de la app: una sola
+# implementación, para que los números en vivo y los del informe no diverjan.
+from loudness_lab.bs1770 import (SILENCIO, MedidorBloques, db, integrado, lra, lufs,  # noqa: F401
+                                 media_movil, refinar_corte)
 
 
 # ----------------------------------------------------------------------------
@@ -75,11 +43,7 @@ def medir_bloques(carpeta, sesion, true_peak=True):
         raise SystemExit(f"No hay archivos audio_*.wav en {carpeta}")
 
     sr = sf.info(os.path.join(carpeta, archivos[0])).samplerate
-    blk = sr // 10
-    sos = filtro_k(sr)
-    zi = None
-    resto = None
-    ctx_tp = None
+    medidor = None
     z_list, sp_list, tp_list = [], [], []
     inicios = []
     total = 0
@@ -90,69 +54,18 @@ def medir_bloques(carpeta, sesion, true_peak=True):
         inicios.append({"archivo": nombre, "frame_global_inicio": total, "frames": info.frames})
         total += info.frames
         print(f"  [{n}/{len(archivos)}] {nombre}  ({info.frames / sr / 60:.1f} min)", flush=True)
-        for x in sf.blocks(ruta, blocksize=blk * 100, dtype="float32", always_2d=True):
-            if resto is not None and len(resto):
-                x = np.vstack([resto, x])
-            usable = (len(x) // blk) * blk
-            resto = x[usable:]
-            x = x[:usable].astype(np.float64)
-            if not usable:
-                continue
-            if zi is None:
-                zi = np.zeros((sos.shape[0], 2, x.shape[1]))
-            y, zi = sosfilt(sos, x, axis=0, zi=zi)
-            nb = usable // blk
-            ms = (y.reshape(nb, blk, -1) ** 2).mean(axis=1)  # media cuadrática por canal
-            z_list.append(ms.sum(axis=1))  # canales L/R con peso 1
-            sp_list.append(np.abs(x).reshape(nb, blk, -1).max(axis=(1, 2)))
-            if true_peak:
-                pre = ctx_tp if ctx_tp is not None else np.zeros((0, x.shape[1]))
-                xx = np.vstack([pre, x])
-                up = np.abs(resample_poly(xx, 4, 1, axis=0))[len(pre) * 4:]
-                tp_list.append(up.reshape(nb, blk * 4, -1).max(axis=(1, 2)))
-                ctx_tp = x[-32:]
-    z = np.concatenate(z_list)
-    sp = np.concatenate(sp_list)
-    tp = np.concatenate(tp_list) if true_peak else sp.copy()
-    return sr, z, sp, tp, inicios
-
-
-# ----------------------------------------------------------------------------
-# Métricas BS.1770 / EBU 3342 sobre un rango de bloques de 100 ms [a, b)
-# ----------------------------------------------------------------------------
-def integrado(z, a, b):
-    """LUFS integrado con gating absoluto (-70) y relativo (-10 LU), bloques de 400 ms con 75% solape."""
-    if b - a < 4:
-        return np.nan
-    m = media_movil(z[a:b], 4)[3:]
-    lm = lufs(m)
-    m = m[lm > ABS_GATE]
-    if not len(m):
-        return np.nan
-    rel = lufs(m.mean()) - 10
-    m = m[lufs(m) > rel]
-    return float(lufs(m.mean())) if len(m) else np.nan
-
-
-def lra(z, a, b):
-    """Loudness Range (EBU Tech 3342): percentiles 10-95 de short-term, gating -70 abs y -20 LU rel."""
-    if b - a < 30:
-        return np.nan
-    s = media_movil(z[a:b], 30)[29:]
-    ls = lufs(s)
-    sel = ls > ABS_GATE
-    if not sel.any():
-        return np.nan
-    rel = lufs(s[sel].mean()) - 20
-    v = ls[sel & (ls > rel)]
-    if len(v) < 2:
-        return np.nan
-    return float(np.percentile(v, 95) - np.percentile(v, 10))
-
-
-def db(x):
-    with np.errstate(divide="ignore"):
-        return 20 * np.log10(np.maximum(x, 1e-12))
+        for x in sf.blocks(ruta, blocksize=sr * 10, dtype="float32", always_2d=True):
+            if medidor is None:
+                medidor = MedidorBloques(sr, x.shape[1], true_peak=true_peak)
+            zc, sp, tp = medidor.procesar(x)
+            z_list.append(zc.sum(axis=1))  # canales L/R con peso 1
+            sp_list.append(sp)
+            tp_list.append(tp)
+    zc, sp, tp = medidor.terminar()  # el último bloque espera las muestras que completan su true peak
+    z_list.append(zc.sum(axis=1))
+    sp_list.append(sp)
+    tp_list.append(tp)
+    return sr, np.concatenate(z_list), np.concatenate(sp_list), np.concatenate(tp_list), inicios
 
 
 # ----------------------------------------------------------------------------
@@ -171,19 +84,6 @@ def leer_pistas(carpeta, blk_frames):
                 continue
             eventos.append(r)
     return eventos
-
-
-def refinar_corte(mom, b, ventana):
-    """Busca el punto más silencioso cerca del cambio reportado (el aviso de Windows llega con retraso).
-    Solo mueve el corte si hay una caída clara (>= 6 LU bajo la mediana de la zona)."""
-    a0, b0 = max(0, b - ventana), min(len(mom), b + ventana)
-    zona = mom[a0:b0]
-    if not len(zona) or np.all(np.isnan(zona)):
-        return b, False
-    i = int(np.nanargmin(zona))
-    if np.nanmedian(zona) - zona[i] >= 6:
-        return a0 + i, True
-    return b, False
 
 
 def segmentar(eventos, mom, n_bloques, refinar_s):
