@@ -5,7 +5,9 @@ música se envía al cable virtual (CABLE Input) en vez de a los parlantes, y se
 loopback del cable.
 """
 
+import contextlib
 import queue
+import threading
 import time
 
 import numpy as np
@@ -23,6 +25,24 @@ ARRANQUE_SUCIO_S = 0.2
 def _pa():
     import pyaudiowpatch as pa
     return pa
+
+
+# PortAudio no tolera inicializarse ni cerrarse desde dos hilos a la vez: la ventana, al abrir,
+# listaba dispositivos y hacía el chequeo previo en paralelo, y el proceso se caía con un acceso
+# a memoria inválido dentro de PyAudio() (2 de cada 3 aperturas del .exe). Todo uso de PortAudio
+# fuera del motor pasa por aquí, de a uno. Reentrante porque unas funciones llaman a otras.
+_CANDADO = threading.RLock()
+
+
+@contextlib.contextmanager
+def _portaudio():
+    pa = _pa()
+    with _CANDADO:
+        p = pa.PyAudio()
+        try:
+            yield p, pa
+        finally:
+            p.terminate()
 
 
 def es_cable(nombre):
@@ -46,17 +66,13 @@ def _predeterminada(p, pa):
 def listar():
     """{"predeterminada": nombre, "salidas": [{nombre, sr, canales, cable, grabable}]}.
     Una salida es grabable si tiene su loopback."""
-    pa = _pa()
-    p = pa.PyAudio()
-    try:
+    with _portaudio() as (p, pa):
         loop = {d["name"][:-len(SUFIJO_LOOPBACK)] for d in p.get_loopback_device_info_generator()
                 if d["name"].endswith(SUFIJO_LOOPBACK)}
         salidas = [{"nombre": d["name"], "sr": int(d["defaultSampleRate"]), "canales": d["maxOutputChannels"],
                     "cable": es_cable(d["name"]), "grabable": d["name"] in loop}
                    for d in _salidas_wasapi(p, pa)]
         return {"predeterminada": _predeterminada(p, pa)["name"], "salidas": salidas}
-    finally:
-        p.terminate()
 
 
 def nombre_por_defecto():
@@ -132,10 +148,8 @@ def _medir(x, sr):
 def medir_niveles(segundos=1.5):
     """Cuánto suena cada salida ahora mismo: sirve para ver a dónde está mandando el audio la
     app de música. Una salida sin nada sonando no entrega datos (queda como None)."""
-    pa = _pa()
-    p = pa.PyAudio()
     out = []
-    try:
+    with _portaudio() as (p, pa):
         for s in listar()["salidas"]:
             if not s["grabable"]:
                 continue
@@ -143,8 +157,6 @@ def medir_niveles(segundos=1.5):
             x = _capturar(p, pa, lb, segundos)
             l, _ = _medir(x, int(lb["defaultSampleRate"]))
             out.append({"nombre": s["nombre"], "lufs": None if np.isnan(l) else l})
-    finally:
-        p.terminate()
     return out
 
 
@@ -152,9 +164,7 @@ def probar_cadena(nombre, nivel_dbfs=-20.0, segundos=4.0):
     """Reproduce un tono de 1 kHz a `nivel_dbfs` en la salida y lo graba por su loopback.
     En estéreo ese tono mide exactamente `nivel_dbfs` LUFS: si la cadena (Windows, el cable,
     el grabador) altera algo, aparece aquí. Primero comprueba que no haya otra cosa sonando."""
-    pa = _pa()
-    p = pa.PyAudio()
-    try:
+    with _portaudio() as (p, pa):
         lb, salida = buscar(p, pa, nombre)
         if salida is None:
             return {"ok": False, "mensaje": "No encuentro la salida para reproducir el tono."}
@@ -175,8 +185,6 @@ def probar_cadena(nombre, nivel_dbfs=-20.0, segundos=4.0):
             return np.repeat(s[:, None], ch_out, axis=1).tobytes()
 
         x = _capturar(p, pa, lb, segundos, reproducir=tono, salida=salida)
-    finally:
-        p.terminate()
     if len(x) < sr * 2:
         return {"ok": False, "mensaje": "No llegó audio al grabador durante la prueba."}
     x = x[sr: len(x) - sr // 2]  # sin el arranque ni el final

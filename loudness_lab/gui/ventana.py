@@ -113,7 +113,18 @@ class Tarea(QObject):
                 return
             self.listo.emit(r)
 
-        threading.Thread(target=correr, daemon=True).start()
+        self.hilo = threading.Thread(target=correr, daemon=True)
+        self.hilo.start()
+
+    @classmethod
+    def esperar_todas(cls, limite_s=3.0):
+        """Al cerrar, espera a que terminen las tareas en curso: cortarlas a mitad de código
+        nativo (audio de Windows, metadata) puede tumbar el proceso al salir."""
+        fin = time.time() + limite_s
+        for t in list(cls.activas):
+            h = getattr(t, "hilo", None)
+            if h is not None:
+                h.join(max(0.0, fin - time.time()))
 
 
 # ----------------------------------------------------------------------------
@@ -1236,6 +1247,22 @@ def _paleta(app):
     pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#111827"))
     app.setPalette(pal)
     pg.setConfigOptions(antialias=True, background="w", foreground="#4b5563")
+    # Con esta paleta clara, Fusion dibuja las casillas con un borde casi invisible: se marcan
+    # con borde y ticket propios para que se note que son casillas.
+    ticket = sistema.carpeta_app() / "ticket.svg"
+    try:
+        ticket.write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 '
+                          '6-7" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" '
+                          'stroke-linejoin="round"/></svg>', encoding="utf-8")
+    except OSError:
+        pass
+    app.setStyleSheet(
+        "QCheckBox::indicator { width: 15px; height: 15px; border: 1px solid #7b8494; border-radius: 3px;"
+        " background: white; }"
+        f"QCheckBox::indicator:hover {{ border-color: {ACENTO}; }}"
+        f"QCheckBox::indicator:checked {{ background: {ACENTO}; border-color: {ACENTO};"
+        f" image: url('{ticket.as_posix()}'); }}"
+        "QCheckBox::indicator:disabled { background: #eceef1; border-color: #c3c8d0; }")
 
 
 def main():
@@ -1264,4 +1291,6 @@ def main():
             app.quit()
 
         QTimer.singleShot(int(seg * 1000), capturar)
-    return app.exec()
+    codigo = app.exec()
+    Tarea.esperar_todas()
+    return codigo

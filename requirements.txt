@@ -7,3 +7,6 @@ winrt-runtime
 winrt-Windows.Media.Control
 winrt-Windows.Foundation
 winrt-Windows.Foundation.Collections
+# ventana de la app (Loudness Lab)
+PySide6
+pyqtgraph

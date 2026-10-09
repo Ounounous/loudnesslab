@@ -4,10 +4,27 @@ Sin argumentos abre la ventana. Con --motor corre el motor de grabación (la ven
 así, en un proceso aparte).
 """
 
+import faulthandler
+import os
 import sys
 
 
+def _registrar_caidas():
+    """Si el proceso se cae en código nativo (audio, Qt, Windows), la traza queda en
+    %APPDATA%\\LoudnessLab\\caidas.log: sin esto, una caída a mitad de una grabación larga
+    no deja ninguna pista."""
+    try:
+        carpeta = os.path.join(os.environ.get("APPDATA", "."), "LoudnessLab")
+        os.makedirs(carpeta, exist_ok=True)
+        f = open(os.path.join(carpeta, "caidas.log"), "a", encoding="utf-8")
+        faulthandler.enable(file=f, all_threads=True)
+        return f
+    except OSError:
+        return None
+
+
 def main():
+    _archivo_caidas = _registrar_caidas()  # noqa: F841  (debe quedar abierto mientras corre)
     if "--motor" in sys.argv:
         from loudness_lab.motor import main as motor
         return motor(sys.argv[1:])
