@@ -834,6 +834,7 @@ class PestanaChequeo(QWidget):
         Tarea(trabajo).iniciar(lambda r: self._mostrar(r, cfg), lambda m: (self._limpiar(), self._fila("mal", m)))
 
     def _mostrar(self, r, cfg):
+        from .. import metadata
         self._limpiar()
         disp = r["disp"]
         cables = [s for s in disp["salidas"] if s["cable"]]
@@ -863,9 +864,8 @@ class PestanaChequeo(QWidget):
         elif not cfg.app:
             self._fila("aviso", "No elegiste qué app seguir: se tomará la que Windows considere activa.")
         else:
-            hay = [a for a in apps if cfg.app.lower() in (a["app"] or "").lower()]
-            if hay:
-                a = hay[0]
+            a = metadata.elegir_info(apps, cfg.app)
+            if a:
                 self._fila("ok", f"{a['app']} publica qué suena ({a['estado']}: {a['artista']} – {a['titulo']})")
             else:
                 otras = ", ".join(a["app"] for a in apps) or "ninguna"

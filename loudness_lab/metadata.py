@@ -69,16 +69,42 @@ async def _info_sesion(sesion):
             "posicion_s": pos, "duracion_s": dur}
 
 
+def _reproduciendo(sesion):
+    try:
+        return int(sesion.get_playback_info().playback_status) == 4
+    except Exception:
+        return False
+
+
+def elegir(items, filtro_app, nombre, sonando):
+    """Con varias apps que calzan con el filtro gana la de nombre exacto y, si no hay, la que está
+    sonando: «chrome» (YouTube en el navegador) también calza con las apps web instaladas desde
+    Chrome, como «Chrome._crx_…» de Soundtrack, y no deben confundirse."""
+    f = filtro_app.lower()
+    calzan = [x for x in items if f in (nombre(x) or "").lower()]
+    for x in calzan:
+        if (nombre(x) or "").lower() == f:
+            return x
+    for x in calzan:
+        if sonando(x):
+            return x
+    return calzan[0] if calzan else None
+
+
+def elegir_sesion(sesiones, filtro_app):
+    return elegir(sesiones, filtro_app, lambda s: s.source_app_user_model_id, _reproduciendo)
+
+
+def elegir_info(apps, filtro_app):
+    """Lo mismo sobre lo que devuelve listar_apps()."""
+    return elegir(apps, filtro_app, lambda a: a["app"], lambda a: a["estado"] == "reproduciendo")
+
+
 async def leer_media(mgr, filtro_app):
     """La sesión de la app elegida. Con un filtro, si esa app no está, devuelve None: no cae en
     otra app que esté sonando, porque registraría sus canciones como si fueran de la elegida."""
-    sesiones = list(mgr.get_sessions())
-    sesion = None
     if filtro_app:
-        for s in sesiones:
-            if filtro_app.lower() in (s.source_app_user_model_id or "").lower():
-                sesion = s
-                break
+        sesion = elegir_sesion(list(mgr.get_sessions()), filtro_app)
     else:
         sesion = mgr.get_current_session()
     if sesion is None:
