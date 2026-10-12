@@ -1,0 +1,110 @@
+Caso   Qué                                                                   Medido  Esperado              Resultado
+1      Tono 1 kHz: integrado                                                 -22.95  -23.0 (-0.1/+0.1)     OK
+1      Tono 1 kHz: momentary (valores válidos)                      -22.95 a -22.95  -23.0 (-0.1/+0.1)     OK
+1      Tono 1 kHz: short-term (valores válidos)                     -22.95 a -22.95  -23.0 (-0.1/+0.1)     OK
+2      Tono 1 kHz: integrado                                                 -32.96  -33.0 (-0.1/+0.1)     OK
+2      Tono 1 kHz: momentary (valores válidos)                      -32.96 a -32.96  -33.0 (-0.1/+0.1)     OK
+2      Tono 1 kHz: short-term (valores válidos)                     -32.96 a -32.96  -33.0 (-0.1/+0.1)     OK
+3      Gating relativo/absoluto: integrado                                   -23.01  -23.0 (-0.1/+0.1)     OK
+4      Gating relativo/absoluto: integrado                                   -23.01  -23.0 (-0.1/+0.1)     OK
+5      Gating relativo/absoluto: integrado                                   -22.98  -23.0 (-0.1/+0.1)     OK
+6      Señal 5.0 canales                                                          -  -                     no aplica  la herramienta mide estéreo (L y R con peso 1)
+7      Programa auténtico 1 (NLR): integrado                                 -22.99  -23.0 (-0.1/+0.1)     OK
+8      Programa auténtico 2 (WLR): integrado                                 -23.00  -23.0 (-0.1/+0.1)     OK
+9      Short-term constante tras 3 s                                -22.99 a -22.99  -23.0 (-0.1/+0.1)     OK
+10     Máximo short-term de cada uno de los 20 archivos             -23.07 a -22.99  -23.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  1                                            -37.99  -38.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  2                                            -37.07  -37.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  3                                            -35.99  -36.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  4                                            -35.07  -35.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  5                                            -33.99  -34.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  6                                            -33.07  -33.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  7                                            -31.99  -32.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  8                                            -31.07  -31.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono  9                                            -29.99  -30.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 10                                            -29.07  -29.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 11                                            -27.99  -28.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 12                                            -27.07  -27.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 13                                            -25.99  -26.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 14                                            -25.07  -25.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 15                                            -23.99  -24.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 16                                            -23.07  -23.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 17                                            -21.99  -22.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 18                                            -21.07  -21.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 19                                            -19.99  -20.0 (-0.1/+0.1)     OK
+11     Máximo short-term, tono 20                                            -19.07  -19.0 (-0.1/+0.1)     OK
+12     Momentary constante tras 1 s                                 -22.96 a -22.96  -23.0 (-0.1/+0.1)     OK
+13     Máximo momentary, archivo  1 (silencio inicial 0 ms)                  -22.99  -23.0 (-0.1/+0.1)     OK
+13     Máximo momentary, archivo  2 (silencio inicial 20 ms)                 -23.22  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo  3 (silencio inicial 40 ms)                 -23.45  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo  4 (silencio inicial 60 ms)                 -23.45  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo  5 (silencio inicial 80 ms)                 -23.22  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo  6 (silencio inicial 100 ms)                -22.99  -23.0 (-0.1/+0.1)     OK
+13     Máximo momentary, archivo  7 (silencio inicial 120 ms)                -23.22  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo  8 (silencio inicial 140 ms)                -23.45  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo  9 (silencio inicial 160 ms)                -23.45  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 10 (silencio inicial 180 ms)                -23.22  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 11 (silencio inicial 200 ms)                -22.99  -23.0 (-0.1/+0.1)     OK
+13     Máximo momentary, archivo 12 (silencio inicial 220 ms)                -23.22  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 13 (silencio inicial 240 ms)                -23.45  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 14 (silencio inicial 260 ms)                -23.45  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 15 (silencio inicial 280 ms)                -23.22  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 16 (silencio inicial 300 ms)                -22.99  -23.0 (-0.1/+0.1)     OK
+13     Máximo momentary, archivo 17 (silencio inicial 320 ms)                -23.22  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 18 (silencio inicial 340 ms)                -23.45  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 19 (silencio inicial 360 ms)                -23.45  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+13     Máximo momentary, archivo 20 (silencio inicial 380 ms)                -23.22  -23.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono  1 (silencio inicial 0 ms)                     -37.99  -38.0 (-0.1/+0.1)     OK
+14     Máximo momentary, tono  2 (silencio inicial 20 ms)                    -37.22  -37.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono  3 (silencio inicial 40 ms)                    -36.45  -36.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono  4 (silencio inicial 60 ms)                    -35.45  -35.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono  5 (silencio inicial 80 ms)                    -34.22  -34.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono  6 (silencio inicial 100 ms)                   -32.99  -33.0 (-0.1/+0.1)     OK
+14     Máximo momentary, tono  7 (silencio inicial 120 ms)                   -32.22  -32.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono  8 (silencio inicial 140 ms)                   -31.45  -31.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono  9 (silencio inicial 160 ms)                   -30.45  -30.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 10 (silencio inicial 180 ms)                   -29.22  -29.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 11 (silencio inicial 200 ms)                   -27.99  -28.0 (-0.1/+0.1)     OK
+14     Máximo momentary, tono 12 (silencio inicial 220 ms)                   -27.22  -27.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 13 (silencio inicial 240 ms)                   -26.45  -26.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 14 (silencio inicial 260 ms)                   -25.45  -25.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 15 (silencio inicial 280 ms)                   -24.22  -24.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 16 (silencio inicial 300 ms)                   -22.99  -23.0 (-0.1/+0.1)     OK
+14     Máximo momentary, tono 17 (silencio inicial 320 ms)                   -22.22  -22.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 18 (silencio inicial 340 ms)                   -21.45  -21.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 19 (silencio inicial 360 ms)                   -20.45  -20.0 (-0.1/+0.1)     FALLA (límite conocido)
+14     Máximo momentary, tono 20 (silencio inicial 380 ms)                   -19.22  -19.0 (-0.1/+0.1)     FALLA (límite conocido)
+15     True peak máximo (dBTP)                                                -5.99  -6.0 (-0.4/+0.2)      OK
+16     True peak máximo (dBTP)                                                -5.99  -6.0 (-0.4/+0.2)      OK
+17     True peak máximo (dBTP)                                                -5.99  -6.0 (-0.4/+0.2)      OK
+18     True peak máximo (dBTP)                                                -5.99  -6.0 (-0.4/+0.2)      OK
+19     True peak máximo (dBTP)                                                 3.02  +3.0 (-0.4/+0.2)      OK
+20     True peak máximo (dBTP)                                                -0.12  +0.0 (-0.4/+0.2)      OK
+21     True peak máximo (dBTP)                                                -0.11  +0.0 (-0.4/+0.2)      OK
+22     True peak máximo (dBTP)                                                -0.14  +0.0 (-0.4/+0.2)      OK
+23     True peak máximo (dBTP)                                                -0.11  +0.0 (-0.4/+0.2)      OK
+L1     LRA (LU)                                                               10.00  +10.0 (-1/+1)         OK
+L2     LRA (LU)                                                                5.00  +5.0 (-1/+1)          OK
+L3     LRA (LU)                                                               20.00  +20.0 (-1/+1)         OK
+L4     LRA (LU)                                                               15.00  +15.0 (-1/+1)         OK
+L5     LRA (LU)                                                                4.98  +5.0 (-1/+1)          OK
+L6     LRA (LU)                                                               15.01  +15.0 (-1/+1)         OK
+extra  Tono 1 kHz de -20 LUFS: integrado                                     -19.95  -20.0 (-0.1/+0.1)     OK
+extra  Tono 1 kHz de -26 LUFS: integrado                                     -25.95  -26.0 (-0.1/+0.1)     OK
+extra  Tono 1 kHz de -40 LUFS: integrado                                     -39.99  -40.0 (-0.1/+0.1)     OK
+extra  Ruido rosa de referencia (1 canal): integrado                         -22.97  -23.0 (-0.1/+0.1)     OK
+propio Trozos de cualquier tamaño == una pasada (68 archivos)                 68/68  68/68                 OK
+propio Medidor en vivo == análisis (68 archivos)                              68/68  68/68                 OK
+ffmpeg seq-3341-7_seq-3342-5-24bit.wav: integrado (LUFS)                     -22.99  -23.0 (±0.1)          OK
+ffmpeg seq-3341-7_seq-3342-5-24bit.wav: LRA (LU)                               4.98  +5.0 (±0.3)           OK
+ffmpeg seq-3341-7_seq-3342-5-24bit.wav: true peak (dBTP)                      -8.91  -8.9 (±0.2)           OK
+ffmpeg seq-3341-2011-8_seq-3342-6-24bit-v02.wav: integrado (LUFS)            -23.00  -23.0 (±0.1)          OK
+ffmpeg seq-3341-2011-8_seq-3342-6-24bit-v02.wav: LRA (LU)                     15.01  +15.0 (±0.3)          OK
+ffmpeg seq-3341-2011-8_seq-3342-6-24bit-v02.wav: true peak (dBTP)             -2.64  -2.6 (±0.2)           OK
+ffmpeg sesion.wav: integrado (LUFS)                                          -14.96  -15.0 (±0.1)          OK
+ffmpeg sesion.wav: LRA (LU)                                                    4.60  +4.6 (±0.3)           OK
+ffmpeg sesion.wav: true peak (dBTP)                                           -1.25  -1.3 (±0.2)           OK
+
+72 correctas, 0 fallidas sin explicación, 32 fallidas por un límite conocido, 1 no aplican.
+Límite conocido (casos 13 y 14): momentary y short-term se calculan cada 100 ms; un tono corto que no
+empieza en esa rejilla se lee hasta 0,46 dB más bajo. No afecta al integrado ni al LRA.
