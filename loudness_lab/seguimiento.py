@@ -77,6 +77,10 @@ class Seguidor:
         self.bloques_musica = 0
         self.silencio_bloques = 0
         self.tp_max = 0.0
+        self.saltos_notorios = []  # saltos sobre el umbral que aún no se informan (ver _revisar_salto)
+        self.min_bloques = max(100, math.ceil(min_dur * 10))
+        self.piso = 0              # bloque de la última pausa: el ajuste de un corte no puede pasar de ahí
+        self.tras_pausa = False    # la próxima canción empieza al reanudar: llega empezada, no desde su inicio
 
     @property
     def n(self):
@@ -101,18 +105,30 @@ class Seguidor:
         self.tp_max = max(self.tp_max, float(np.max(tp)))
         if self.pendiente is not None and self.n >= self.pendiente["limite"]:
             self._resolver_pendiente()
+        self._revisar_salto()
 
     def evento(self, e, b):
         """Un aviso de la metadata en el bloque b (misma lógica que analizar.segmentar)."""
         b = max(0, min(int(b), self.n))
-        if e.get("evento") == "cambio_pista" and e.get("titulo"):
+        if e.get("evento") == "pausa":
+            # La grabación se pausó: lo que sigue no continúa lo anterior. La canción en curso se cierra
+            # acá y no se calcula ningún salto entre la de antes y la de después.
             if self.pendiente is not None:
                 self._resolver_pendiente()
-            self.pendiente = {"b": b, "e": e, "limite": b + self.ventana}
+            self._cortar(b, None, False)
+            self.ultima = None
+            self.piso = b
+            self.tras_pausa = True
+        elif e.get("evento") == "cambio_pista" and e.get("titulo"):
+            if self.pendiente is not None:
+                self._resolver_pendiente()
+            self.pendiente = {"b": b, "e": e, "limite": b + self.ventana, "tras_pausa": self.tras_pausa}
+            self.tras_pausa = False
         elif e.get("evento") in ("cambio_estado", "sin_sesion") and e.get("estado") != "reproduciendo":
             if self.pendiente is not None:
                 self._resolver_pendiente()
             self._cortar(b, None, False)
+            self.tras_pausa = False
 
     def terminar(self):
         """Cierra lo que esté abierto al final de la sesión (la última canción queda incompleta,
@@ -125,12 +141,33 @@ class Seguidor:
     def _resolver_pendiente(self):
         p, self.pendiente = self.pendiente, None
         if self.ventana:
-            b, movido = refinar_corte(self.mom.v, p["b"], self.ventana)
+            b, movido = refinar_corte(self.mom.v, p["b"], self.ventana, desde=self.piso)
         else:
             b, movido = p["b"], False
-        self._cortar(b, p["e"], movido)
+        self._cortar(b, p["e"], movido, p.get("tras_pausa", False))
 
-    def _cortar(self, b, e, movido):
+    def _revisar_salto(self):
+        """Calcula el salto de la canción en curso con la anterior apenas cumple la duración mínima y,
+        si pasa el umbral, lo deja en saltos_notorios (una vez por canción). Se espera a la duración
+        mínima, y no solo a los 10 s medidos, para coincidir con las estadísticas: una canción más
+        corta no cuenta como cambio, y entonces tampoco debe dejar un recorte."""
+        a = self.actual
+        if a is None or a.get("salto_revisado") or self.n - a["ini"] < self.min_bloques:
+            return
+        a["salto_revisado"] = True
+        prev = self.ultima
+        if prev is None or prev["corta"] or a["ini"] / 10 - (prev["inicio_s"] + prev["duracion_s"]) > 1:
+            return
+        primeros = integrado(self.z.v, a["ini"], a["ini"] + 100)
+        salto = primeros - prev["ultimos_10s"]
+        if not math.isnan(salto) and abs(salto) > self.umbral:
+            self.saltos_notorios.append({
+                "corte": a["ini"], "salto": salto, "ultimos_10s": prev["ultimos_10s"], "primeros_10s": primeros,
+                "de": f"{prev['artista']} - {prev['titulo']}", "a": f"{a['artista']} - {a['titulo']}",
+                "corte_ajustado": a["corte_ajustado"],
+            })
+
+    def _cortar(self, b, e, movido, tras_pausa=False):
         if self.actual is not None and b > self.actual["ini"]:
             self._cerrar(self.actual, b)
         if e is None:
@@ -138,7 +175,7 @@ class Seguidor:
         else:
             self.actual = {"ini": b, "artista": e.get("artista") or "", "titulo": e.get("titulo") or "",
                            "album": e.get("album") or "", "app": e.get("app") or "",
-                           "corte_ajustado": movido}
+                           "corte_ajustado": movido, "tras_pausa": tras_pausa}
 
     def _cerrar(self, pista, fin):
         a, b = pista["ini"], fin
@@ -148,6 +185,7 @@ class Seguidor:
             "inicio_s": a / 10, "duracion_s": dur,
             "artista": pista["artista"], "titulo": pista["titulo"], "album": pista["album"],
             "app": pista["app"], "corte_ajustado": pista["corte_ajustado"],
+            "tras_pausa": pista.get("tras_pausa", False),
             "lufs": integrado(z, a, b), "lra": lra(z, a, b),
             "tp": float(db(self.tp.v[a:b].max())), "sp": float(db(self.sp.v[a:b].max())),
             "primeros_10s": integrado(z, a, min(b, a + 100)),

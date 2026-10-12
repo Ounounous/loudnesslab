@@ -30,6 +30,7 @@ import soundfile as sf
 # implementación, para que los números en vivo y los del informe no diverjan.
 from loudness_lab.bs1770 import (SILENCIO, MedidorBloques, db, integrado, lra, lufs,  # noqa: F401
                                  media_movil, refinar_corte)
+from loudness_lab.sesiones import pausas_de
 
 
 # ----------------------------------------------------------------------------
@@ -87,27 +88,45 @@ def leer_pistas(carpeta, blk_frames):
 
 
 def segmentar(eventos, mom, n_bloques, refinar_s):
-    """Convierte los eventos en segmentos [inicio, fin) por canción."""
+    """Convierte los eventos en segmentos [inicio, fin) por canción.
+
+    Una pausa de la grabación (evento «pausa») corta la canción en curso. La que suena al reanudar
+    llega empezada (tras_pausa): no se junta con la de antes y su corte no se ajusta hacia el otro
+    lado de la pausa, que no es continuación de este."""
     ventana = int(refinar_s * 10)
-    cortes = []
-    for e in eventos:
-        if e["evento"] == "cambio_pista" and e.get("titulo"):
-            b, mov = refinar_corte(mom, e["bloque"], ventana) if ventana else (e["bloque"], False)
-            cortes.append((b, e, mov))
+    # bloque de la próxima pausa después de cada evento: en vivo, el aviso se resuelve ahí si la
+    # pausa llega antes de que pasen los segundos de ajuste
+    sig_pausa, prox = [None] * len(eventos), None
+    for i in range(len(eventos) - 1, -1, -1):
+        sig_pausa[i] = prox
+        if eventos[i]["evento"] == "pausa":
+            prox = eventos[i]["bloque"]
+    cortes, piso, tras = [], 0, False
+    for i, e in enumerate(eventos):
+        if e["evento"] == "pausa":
+            cortes.append((e["bloque"], dict(e, titulo=None), False, False))
+            piso, tras = e["bloque"], True
+        elif e["evento"] == "cambio_pista" and e.get("titulo"):
+            b, mov = (refinar_corte(mom, e["bloque"], ventana, piso, sig_pausa[i]) if ventana
+                      else (e["bloque"], False))
+            cortes.append((b, e, mov, tras))
+            tras = False
         elif e["evento"] in ("cambio_estado", "sin_sesion") and e.get("estado") != "reproduciendo":
-            cortes.append((e["bloque"], dict(e, titulo=None), False))
+            cortes.append((e["bloque"], dict(e, titulo=None), False, False))
+            tras = False
     cortes.sort(key=lambda c: c[0])
     segs = []
-    for i, (b, e, mov) in enumerate(cortes):
+    for i, (b, e, mov, tras_c) in enumerate(cortes):
         fin = cortes[i + 1][0] if i + 1 < len(cortes) else n_bloques
         if e.get("titulo") and fin > b:
             segs.append({"ini": b, "fin": fin, "artista": e.get("artista", ""), "titulo": e["titulo"],
-                         "album": e.get("album", ""), "app": e.get("app", ""), "corte_ajustado": mov})
-    # unir segmentos consecutivos de la misma canción (pausa/reanudación)
+                         "album": e.get("album", ""), "app": e.get("app", ""), "corte_ajustado": mov,
+                         "tras_pausa": tras_c})
+    # unir segmentos consecutivos de la misma canción (pausa/reanudación de la app de música)
     unidos = []
     for s in segs:
-        if unidos and unidos[-1]["titulo"] == s["titulo"] and unidos[-1]["artista"] == s["artista"] \
-                and s["ini"] - unidos[-1]["fin"] <= 1:
+        if unidos and not s["tras_pausa"] and unidos[-1]["titulo"] == s["titulo"] \
+                and unidos[-1]["artista"] == s["artista"] and s["ini"] - unidos[-1]["fin"] <= 1:
             unidos[-1]["fin"] = s["fin"]
         else:
             unidos.append(s)
@@ -144,21 +163,28 @@ def analizar_sesion(carpeta, args):
         except Exception:
             pass
 
+    # Las pausas de la grabación: el audio no las incluye, pero el reloj del PC sí.
+    eventos = leer_pistas(carpeta, sr // 10)
+    pausas = pausas_de(eventos, sr)
+    desplazamiento = np.zeros(n)   # segundos de pausa que hubo antes de cada bloque
+    for t_pausa, duracion in pausas:
+        desplazamiento[t > t_pausa] += duracion
+
     # Curva completa
     with open(os.path.join(salida, "curva_100ms.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["t_s", "hora_pc", "momentary_lufs", "shortterm_lufs", "truepeak_dbtp", "samplepeak_dbfs"])
         tpd, spd = db(tp), db(sp)
         for i in range(n):
-            hora = (inicio_pc + dt.timedelta(seconds=float(t[i]))).strftime("%Y-%m-%d %H:%M:%S.%f")[:-5] \
-                if inicio_pc else ""
+            hora = (inicio_pc + dt.timedelta(seconds=float(t[i] + desplazamiento[i]))).strftime(
+                "%Y-%m-%d %H:%M:%S.%f")[:-5] if inicio_pc else ""
             w.writerow([f"{t[i]:.1f}", hora,
                         "" if np.isnan(mom[i]) else f"{mom[i]:.2f}",
                         "" if np.isnan(st[i]) else f"{st[i]:.2f}",
                         f"{tpd[i]:.2f}", f"{spd[i]:.2f}"])
 
     # Pistas
-    segs = segmentar(leer_pistas(carpeta, sr // 10), mom, n, args.refinar)
+    segs = segmentar(eventos, mom, n, args.refinar)
     pistas = []
     for k, s in enumerate(segs, 1):
         a, b = s["ini"], s["fin"]
@@ -173,13 +199,14 @@ def analizar_sesion(carpeta, args):
             "lufs_primeros_10s": integrado(z, a, min(b, a + 100)),
             "lufs_ultimos_10s": integrado(z, max(a, b - 100), b),
             "corte_ajustado": s["corte_ajustado"], "pista_corta": dur < args.min_dur,
+            "tras_pausa": s["tras_pausa"],
         }
         pistas.append(p)
 
     transiciones = []
     for p1, p2 in zip(pistas, pistas[1:]):
-        if p1["pista_corta"] or p2["pista_corta"]:
-            continue
+        if p1["pista_corta"] or p2["pista_corta"] or p2["tras_pausa"]:
+            continue   # (una canción que llega tras una pausa de la grabación no sigue a la anterior)
         if p2["inicio_s"] - (p1["inicio_s"] + p1["duracion_s"]) > 1:
             continue  # hubo una pausa entre medio
         transiciones.append({
@@ -212,6 +239,7 @@ def analizar_sesion(carpeta, args):
     resumen = {
         "etiqueta": etiqueta, "carpeta": os.path.basename(os.path.normpath(carpeta)), "notas": sesion.get("notas", ""), "inicio_pc": sesion.get("inicio_pc"),
         "horas_grabadas": round(n / 36000, 2), "horas_con_musica": round(float(musica.sum()) / 36000, 2),
+        "pausas": len(pausas), "segundos_en_pausa": round(sum(d for _, d in pausas), 1),
         "lufs_integrado_sesion": integrado(z, 0, n),
         "lra_sesion_lu": lra(z, 0, n),
         "truepeak_max_dbtp": float(tpd.max()),
@@ -261,6 +289,11 @@ def resumen_texto(r, transiciones):
     lineas = [
         f"Sesión: {r['etiqueta']}   {r.get('notas') or ''}",
         f"Duración: {r['horas_grabadas']} h ({r['horas_con_musica']} h con música)",
+    ]
+    if r.get("pausas"):
+        lineas.append(f"Pausas: {r['pausas']} ({r['segundos_en_pausa'] / 60:.1f} min en total, "
+                      "no entran a la medición)")
+    lineas += [
         "",
         "GLOBAL",
         f"  LUFS integrado de toda la sesión: {g(r, 'lufs_integrado_sesion')} LUFS",

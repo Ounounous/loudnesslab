@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QPushButton, QRadioButton, QScrollArea, QSlider, QSplitter, QTableWidget,
@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 import pyqtgraph as pg
 
-from .. import VERSION, protocolo, sistema
+from .. import VERSION, protocolo, sesiones, sistema
 from .. import config as cfgmod
 from ..config import APP_POR_FUENTE
 from ..seguimiento import Serie
@@ -138,10 +138,13 @@ class BarraLUFS(QWidget):
         super().__init__()
         self.titulo = titulo
         self.valor = float("nan")
+        self.texto = None
         self.setMinimumHeight(40)
 
-    def poner(self, v):
+    def poner(self, v, texto=None):
+        """`texto` reemplaza al valor cuando no se está midiendo (en pausa, sesión guardada)."""
         self.valor = v
+        self.texto = texto
         self.update()
 
     def paintEvent(self, _ev):
@@ -173,7 +176,8 @@ class BarraLUFS(QWidget):
         grande.setBold(True)
         p.setFont(grande)
         p.setPen(QColor("#111827"))
-        p.drawText(x1 + 10, 0, 100, bh + 12, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, lufs_txt(v))
+        p.drawText(x1 + 10, 0, 100, bh + 12, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.texto or lufs_txt(v))
         p.end()
 
 
@@ -191,6 +195,7 @@ class PestanaVivo(QWidget):
         self.rango = "1 h"
         self.curva_t, self.curva_st = Serie(3600), Serie(3600)
         self.seg_cortes, self.seg_niveles = [], []
+        self.pausas = []   # [segundo de audio donde empezó, duración] de cada pausa de la grabación
         self.sucio = False
 
         self.lbl_cancion = QLabel("Sin grabación en curso")
@@ -232,7 +237,8 @@ class PestanaVivo(QWidget):
         self.pista_actual = None
         leyenda = QLabel("<span style='color:#4a78b5'>━</span> short-term (3 s) &nbsp; "
                          "<span style='color:#d1495b'>━</span> integrado de cada canción &nbsp; "
-                         "<span style='color:#999'>│</span> cambio de canción")
+                         "<span style='color:#999'>│</span> cambio de canción &nbsp; "
+                         "<span style='color:#999'>⋯</span> hueco = pausa")
         leyenda.setStyleSheet(f"color:{GRIS}")
         rangos = QHBoxLayout()
         rangos.addWidget(leyenda)
@@ -318,8 +324,63 @@ class PestanaVivo(QWidget):
         lay.addWidget(vertical, 1)
 
     # ------------------------------------------------------------------ datos
+    def _a_reloj(self, t, incluye_borde):
+        """Instante del reloj (epoch) de uno o varios segundos de audio: el audio no incluye las
+        pausas, así que se suma lo que duró cada una de las anteriores. Una pausa que empieza justo
+        en t cuenta (incluye_borde) para el inicio de lo que viene después, y no para el último
+        punto de antes."""
+        t = np.asarray(t, dtype=float)
+        if not self.pausas:
+            return self.inicio_epoch + t
+        ini = np.array([p[0] for p in self.pausas])
+        acumulado = np.concatenate([[0.0], np.cumsum([p[1] for p in self.pausas])])
+        return self.inicio_epoch + t + acumulado[np.searchsorted(ini, t, side="right" if incluye_borde else "left")]
+
+    def poner_pausas(self, pausas):
+        self.pausas = [list(p) for p in pausas or []]
+        self.sucio = True
+
+    def limpiar(self):
+        """Deja la pestaña como al abrir la app, sin ninguna sesión."""
+        self.reiniciar({})
+        self.lbl_cancion.setText("Sin grabación en curso")
+        self.lbl_detalle.setText("Configura la sesión y presiona «Iniciar grabación».")
+        self.lbl_med.setText("")
+        self.lbl_salud.setText("")
+        self.bar_mom.poner(float("nan"), "—")
+        self.bar_st.poner(float("nan"), "—")
+        self.pista_actual = None
+        self._poner_stats({})
+        for item in (self.curva, self.cortes, self.niveles, self.nivel_actual):
+            item.setData([], [])
+
+    def mostrar_sesion(self, snap):
+        """Una sesión guardada, reconstruida desde sus archivos (ver sesiones.reconstruir)."""
+        self.reiniciar(snap)
+        c = snap["cerrada"]
+        inicio = dt.datetime.fromtimestamp(snap["inicio_epoch"]).strftime("%d-%m-%Y %H:%M")
+        estado = "terminada" if c["terminada"] else "interrumpida (la grabación no se cerró bien)"
+        self.lbl_cancion.setText(c["nombre"])
+        detalle = (f"Sesión {estado} · empezó el {inicio} · {num(c['horas'], 2)} h grabadas · "
+                   f"{c['canciones']} canciones medidas")
+        if c["pausas"]:
+            detalle += f" · {c['pausas']} pausa{'s' if c['pausas'] != 1 else ''} ({mmss(c['segundos_en_pausa'])} sin grabar)"
+        self.lbl_detalle.setText(detalle)
+        self.lbl_med.setText("")
+        self.bar_mom.poner(float("nan"), "—")
+        self.bar_st.poner(float("nan"), "—")
+        self.pista_actual = None
+        self._poner_stats(snap["estado"].get("sesion") or {})
+        partes = [f"{c['dispositivo'] or '?'}", f"pérdidas {c['perdidas']}"]
+        if c["app"]:
+            partes.append(f"app {c['app']}")
+        if c["motivo"]:
+            partes.append(f"terminó: {c['motivo']}")
+        self.lbl_salud.setText(" · ".join(partes))
+
     def reiniciar(self, snap):
         self.inicio_epoch = snap.get("inicio_epoch")
+        self.pausas = [list(p) for p in snap.get("pausas") or []]
         cfg = snap.get("config") or {}
         self.umbral = float(cfg.get("umbral_salto", 3.0))
         self.curva_t, self.curva_st = Serie(3600), Serie(3600)
@@ -344,7 +405,7 @@ class PestanaVivo(QWidget):
     def agregar_pista(self, p):
         if self.inicio_epoch is None:
             return
-        x0 = self.inicio_epoch + p["inicio_s"]
+        x0 = float(self._a_reloj(p["inicio_s"], True))
         x1 = x0 + p["duracion_s"]
         self.seg_cortes += [(x0, -45.0), (x0, 0.0)]
         if not vacio(p["lufs"]):
@@ -357,6 +418,8 @@ class PestanaVivo(QWidget):
         nombre = f"{p.get('artista') or '?'} – {p.get('titulo') or '?'}"
         if corta:
             nombre += "  (corta: no cuenta)"
+        elif p.get("tras_pausa"):
+            nombre += "  (empezó tras una pausa)"
         valores = [hora, nombre, mmss(p["duracion_s"]), num(p["lufs"]), num(p["lra"]), num(p["tp"]),
                    num(p["salto"], signo=True)]
         for c, v in enumerate(valores):
@@ -384,10 +447,33 @@ class PestanaVivo(QWidget):
         else:
             self.registro.appendPlainText(linea)
 
+    def _poner_stats(self, s):
+        if not s:
+            for lbl in self.stats.values():
+                lbl.setText("—")
+            return
+        self.umbral = s.get("umbral", self.umbral)
+        self.stats["canciones"].setText(str(s.get("canciones", 0)))
+        self.stats["lufs"].setText(f"media {num(s.get('media'))} · mediana {num(s.get('mediana'))}")
+        self.stats["dispersion"].setText(f"desv. {num(s.get('desv'))} LU · rango {num(s.get('min'))} a {num(s.get('max'))}")
+        self.stats["pct"].setText(num(s.get("pct_2lu"), 0, unidad="%"))
+        self.stats["cambios"].setText(f"{s.get('transiciones', 0)} · salto medio {num(s.get('salto_medio'))} LU · "
+                                      f"p95 {num(s.get('salto_p95'))} · máx {num(s.get('salto_max'))}")
+        por_hora = "" if vacio(s.get("por_hora")) else f" ({num(s.get('por_hora'))} por hora)"
+        self.stats["saltos"].setText(f"{s.get('sobre_umbral', 0)} sobre {num(s.get('umbral'), 0)} LU{por_hora}")
+        self.stats["tp"].setText(num(s.get("tp_max"), unidad="dBTP"))
+        self.stats["horas"].setText(num(s.get("horas_musica"), 2))
+
     def actualizar(self, e):
         p = e.get("pista")
         self.pista_actual = p
-        if p:
+        pausado = bool(e.get("pausado"))
+        if pausado:
+            self.lbl_cancion.setText("Grabación en pausa")
+            self.lbl_detalle.setText(f"Hace {mmss(e.get('pausa_s') or 0)}. El audio no se registra: lo que suene "
+                                     "ahora no entra en la medición.")
+            self.lbl_med.setText("")
+        elif p:
             self.lbl_cancion.setText(f"{p.get('artista') or '?'} – {p.get('titulo') or '?'}")
             app = p.get("app") or ""
             self.lbl_detalle.setText(f"{app} · {e.get('estado_app') or '—'} · {mmss(p['t_s'])} en esta canción")
@@ -398,27 +484,18 @@ class PestanaVivo(QWidget):
             self.lbl_med.setText(" · ".join(partes))
         else:
             self.lbl_cancion.setText("Sin canción identificada")
-            self.lbl_detalle.setText("La app elegida no está publicando qué suena (o está en pausa).")
+            self.lbl_detalle.setText("La app elegida no está publicando qué suena (o la app de música está en pausa).")
             self.lbl_med.setText("")
-        self.bar_mom.poner(e.get("momentary"))
-        self.bar_st.poner(e.get("shortterm"))
+        sin_medir = "—" if pausado else None
+        self.bar_mom.poner(e.get("momentary"), sin_medir)
+        self.bar_st.poner(e.get("shortterm"), sin_medir)
 
         s = e.get("sesion") or {}
         if s:
-            self.umbral = s.get("umbral", self.umbral)
-            self.stats["canciones"].setText(str(s.get("canciones", 0)))
-            self.stats["lufs"].setText(f"media {num(s.get('media'))} · mediana {num(s.get('mediana'))}")
-            self.stats["dispersion"].setText(f"desv. {num(s.get('desv'))} LU · rango {num(s.get('min'))} a {num(s.get('max'))}")
-            self.stats["pct"].setText(num(s.get("pct_2lu"), 0, unidad="%"))
-            self.stats["cambios"].setText(f"{s.get('transiciones', 0)} · salto medio {num(s.get('salto_medio'))} LU · "
-                                          f"p95 {num(s.get('salto_p95'))} · máx {num(s.get('salto_max'))}")
-            por_hora = "" if vacio(s.get("por_hora")) else f" ({num(s.get('por_hora'))} por hora)"
-            self.stats["saltos"].setText(f"{s.get('sobre_umbral', 0)} sobre {num(s.get('umbral'), 0)} LU{por_hora}")
-            self.stats["tp"].setText(num(s.get("tp_max"), unidad="dBTP"))
-            self.stats["horas"].setText(num(s.get("horas_musica"), 2))
+            self._poner_stats(s)
 
         h = e.get("salud") or {}
-        partes = [f"Grabando: {h.get('dispositivo', '?')}",
+        partes = [f"{'En pausa' if pausado else 'Grabando'}: {h.get('dispositivo', '?')}",
                   f"disco {num(h.get('libre_gb'), 0)} GB libres (≈ {num(h.get('horas_restantes'), 0)} h)",
                   f"reloj {num(h.get('desfase_s'), 2, signo=True)} s",
                   f"pérdidas {h.get('perdidas', 0)}"]
@@ -440,8 +517,15 @@ class PestanaVivo(QWidget):
             return
         self.sucio = False
         t = self.curva_t.v
-        x = self.inicio_epoch + t
-        self.curva.setData(x, np.maximum(self.curva_st.v, -60.0))
+        x = self._a_reloj(t, False)
+        y = np.maximum(self.curva_st.v, -60.0)
+        if self.pausas and len(t) > 1:
+            # un hueco donde hubo una pausa: sin esto, la línea uniría el último punto de antes con el
+            # primero de después
+            k = np.searchsorted(t, [p[0] for p in self.pausas], side="right")
+            k = np.unique(k[(k > 0) & (k < len(t))])
+            x, y = np.insert(x, k, np.nan), np.insert(y, k, np.nan)
+        self.curva.setData(x, y, connect="finite")
         if self.seg_cortes:
             c = np.array(self.seg_cortes)
             self.cortes.setData(c[:, 0], c[:, 1])
@@ -454,7 +538,7 @@ class PestanaVivo(QWidget):
             self.niveles.setData([], [])
         p = self.pista_actual
         if p and not vacio(p.get("lufs")) and len(x):
-            self.nivel_actual.setData([self.inicio_epoch + p["inicio_s"], x[-1]], [p["lufs"], p["lufs"]])
+            self.nivel_actual.setData([float(self._a_reloj(p["inicio_s"], True)), x[-1]], [p["lufs"], p["lufs"]])
         else:
             self.nivel_actual.setData([], [])
         fin = x[-1] if len(x) else self.inicio_epoch + 60
@@ -705,11 +789,10 @@ class PestanaConfig(QWidget):
         self._aviso_apps("Detectadas: " + "; ".join(
             f"{a['app']} ({a['estado']}: {a['artista']} – {a['titulo']})" for a in apps))
 
-    def bloquear(self, si):
+    def bloquear(self, si, texto=""):
         for g in self.grupos:
             g.setEnabled(not si)
-        self.lbl_bloqueo.setText("Grabación en curso: la configuración queda fija hasta que termine. "
-                                 "Solo se puede cambiar «Escuchar»." if si else "")
+        self.lbl_bloqueo.setText(texto if si else "")
 
     def leer(self):
         return cfgmod.Config(
@@ -724,7 +807,8 @@ class PestanaConfig(QWidget):
             alerta_silencio_min=self.silencio.value(), min_dur=self.min_dur.value(), checklist=self.checklist)
 
     def mostrar(self, c):
-        """Muestra la configuración de una grabación en curso (al reconectarse)."""
+        """Muestra la configuración de una sesión: la de una grabación en curso (al reconectarse) o la
+        de una guardada."""
         self._cargando = True
         self.carpeta.setText(c.get("carpeta_salida", ""))
         self.fuente.setCurrentText(c.get("fuente", ""))
@@ -735,6 +819,16 @@ class PestanaConfig(QWidget):
         self.notas.setPlainText(c.get("notas", ""))
         self.etiqueta.setText(c.get("etiqueta", ""))
         self.app.setCurrentText(c.get("app", ""))
+        self.horas.setValue(float(c.get("horas") or 0))
+        self.umbral.setValue(float(c.get("umbral_salto") or self.umbral.value()))
+        self.silencio.setValue(float(c.get("alerta_silencio_min") or self.silencio.value()))
+        self.min_dur.setValue(float(c.get("min_dur") or self.min_dur.value()))
+        disp = c.get("dispositivo")
+        if disp:
+            i = self.dispositivo.findData(disp)
+            if i >= 0:
+                self.dispositivo.setCurrentIndex(i)
+            self._disp_guardado = disp
         self._cargando = False
 
 
@@ -914,10 +1008,101 @@ class PestanaChequeo(QWidget):
 # ----------------------------------------------------------------------------
 # Ventana
 # ----------------------------------------------------------------------------
+class DialogoSesiones(QDialog):
+    """Las sesiones guardadas en la carpeta de salida; se abre una con doble clic."""
+
+    def __init__(self, padre, base, actual=None):
+        super().__init__(padre)
+        self.setWindowTitle("Sesiones guardadas")
+        self.resize(780, 440)
+        self.elegida = None
+        self.filas = sesiones.listar(base)
+
+        self.tabla = QTableWidget(len(self.filas), 5)
+        self.tabla.setHorizontalHeaderLabels(["Sesión", "Empezó", "Horas", "Canciones", "Estado"])
+        self.tabla.verticalHeader().setVisible(False)
+        self.tabla.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tabla.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tabla.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.tabla.setAlternatingRowColors(True)
+        hdr = self.tabla.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for i, s in enumerate(self.filas):
+            empezo = dt.datetime.fromtimestamp(s["inicio_epoch"]).strftime("%d-%m-%Y %H:%M")
+            # la carpeta es la identidad de la sesión (las anteriores a los nombres únicos traen la fecha)
+            carpeta = os.path.basename(os.path.normpath(s["carpeta"]))
+            for c, v in enumerate([carpeta, empezo, num(s["horas"], 2), str(s["canciones"]), s["estado"]]):
+                it = QTableWidgetItem(v)
+                if c in (2, 3):
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if actual and sesiones._misma_carpeta(s["carpeta"], actual):
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                if s["estado"] != "terminada":
+                    it.setForeground(QBrush(QColor(AMARILLO)))
+                self.tabla.setItem(i, c, it)
+        self.tabla.itemSelectionChanged.connect(self._seleccion)
+        self.tabla.cellDoubleClicked.connect(lambda *_: self._abrir())
+
+        vacia = QLabel("No hay sesiones guardadas en esta carpeta.") if not self.filas else None
+        self.b_abrir = QPushButton("Abrir")
+        self.b_abrir.setDefault(True)
+        self.b_abrir.setEnabled(False)
+        self.b_abrir.clicked.connect(self._abrir)
+        b_otra = QPushButton("Otra carpeta…")
+        b_otra.setToolTip("Abrir una sesión que está en otro lugar (elige la carpeta de la sesión)")
+        b_otra.clicked.connect(self._otra)
+        b_cerrar = QPushButton("Cerrar")
+        b_cerrar.clicked.connect(self.reject)
+        botones = QHBoxLayout()
+        botones.addWidget(b_otra)
+        botones.addStretch()
+        botones.addWidget(b_cerrar)
+        botones.addWidget(self.b_abrir)
+
+        lay = QVBoxLayout(self)
+        carpeta = QLabel(f"En {base}")
+        carpeta.setStyleSheet(f"color:{GRIS}")
+        lay.addWidget(carpeta)
+        lay.addWidget(self.tabla, 1)
+        if vacia:
+            lay.addWidget(vacia)
+        lay.addLayout(botones)
+        if self.filas:
+            self.tabla.selectRow(0)
+
+    def _seleccion(self):
+        filas = self.tabla.selectionModel().selectedRows()
+        ok = bool(filas) and self.filas[filas[0].row()]["estado"] != "en curso"
+        self.b_abrir.setEnabled(ok)
+        self.b_abrir.setToolTip("" if ok or not filas else "Se está grabando: la ventana se conecta sola a esa grabación.")
+
+    def _abrir(self):
+        filas = self.tabla.selectionModel().selectedRows()
+        if filas and self.filas[filas[0].row()]["estado"] != "en curso":
+            self.elegida = self.filas[filas[0].row()]["carpeta"]
+            self.accept()
+
+    def _otra(self):
+        d = QFileDialog.getExistingDirectory(self, "Carpeta de la sesión", os.path.dirname(os.path.normpath(self.filas[0]["carpeta"])) if self.filas else "")
+        if not d:
+            return
+        if not sesiones.es_sesion(d):
+            QMessageBox.warning(self, "No es una sesión", f"«{d}» no tiene un sesion.json: no es una sesión de Loudness Lab.")
+            return
+        self.elegida = os.path.normpath(d)
+        self.accept()
+
+
 class Ventana(QMainWindow):
     def __init__(self):
         super().__init__()
         self.cfg = cfgmod.cargar()
+        self.plantilla = self.cfg          # lo que se guarda como «última configuración»
+        self.ultima_sesion = self.cfg.ultima_sesion
+        self.estado_ui = "detenido"
         self.conn = None
         self.proc = None
         self.esperando = None       # momento en que se lanzó el motor y aún no se conecta
@@ -942,6 +1127,15 @@ class Ventana(QMainWindow):
         self.b_grabar = QPushButton("▶  Iniciar grabación")
         self.b_grabar.setMinimumHeight(34)
         self.b_grabar.clicked.connect(self.grabar_o_detener)
+        self.b_pausa = QPushButton("⏸  Pausar")
+        self.b_pausa.setMinimumHeight(34)
+        self.b_pausa.setToolTip("Pausa momentánea: mientras dura, el audio no se graba ni se mide. "
+                                "Al reanudar, la sesión sigue.")
+        self.b_pausa.clicked.connect(self.pausar_o_reanudar)
+        self.b_pausa.hide()
+        self.b_sesiones = QPushButton("Sesiones…")
+        self.b_sesiones.setToolTip("Abrir una sesión guardada")
+        self.b_sesiones.clicked.connect(self.elegir_sesion)
         self.b_carpeta = QPushButton("Abrir carpeta")
         self.b_carpeta.clicked.connect(self.abrir_carpeta)
         self.chk_escuchar = QCheckBox("Escuchar")
@@ -967,7 +1161,9 @@ class Ventana(QMainWindow):
         barra.addWidget(self.chk_escuchar)
         barra.addWidget(self.sld_vol)
         barra.addSpacing(14)
+        barra.addWidget(self.b_sesiones)
         barra.addWidget(self.b_carpeta)
+        barra.addWidget(self.b_pausa)
         barra.addWidget(self.b_grabar)
 
         self.lbl_alertas = QLabel("")
@@ -1007,30 +1203,139 @@ class Ventana(QMainWindow):
             self.esperando = time.time()
             self._poner_estado("conectando")
         else:
-            self.tabs.setCurrentWidget(self.pestana_config)
-            QTimer.singleShot(400, self.pestana_chequeo.revisar)
+            self._sin_motor()
 
     # ------------------------------------------------------------------ config
     def guardar_config(self):
-        self.cfg = self.pestana_config.leer()
-        self.cfg.monitor = self.chk_escuchar.isChecked()
-        self.cfg.monitor_vol = self.sld_vol.value() / 100
+        if self.estado_ui in ("viendo", "terminada"):
+            # La pestaña muestra una sesión guardada: lo que hay en ella no es la configuración
+            # para la próxima grabación y no la reemplaza.
+            self.plantilla.monitor = self.chk_escuchar.isChecked()
+            self.plantilla.monitor_vol = self.sld_vol.value() / 100
+        else:
+            self.cfg = self.pestana_config.leer()
+            self.cfg.monitor = self.chk_escuchar.isChecked()
+            self.cfg.monitor_vol = self.sld_vol.value() / 100
+            self.plantilla = self.cfg
+        self.plantilla.ultima_sesion = self.ultima_sesion
         try:
-            cfgmod.guardar(self.cfg)
+            cfgmod.guardar(self.plantilla)
         except OSError:
             pass
+
+    def _recordar_sesion(self, carpeta):
+        self.ultima_sesion = carpeta
+        self.guardar_config()
+
+    def _poner_nombre(self, nombre):
+        self.lbl_etiqueta.setText(nombre)
+        self.setWindowTitle(f"{nombre} — Loudness Lab {VERSION}" if nombre else f"Loudness Lab {VERSION}")
 
     def grabando(self):
         return self.en_curso or self.esperando is not None
 
     # ------------------------------------------------------------------ motor
     def grabar_o_detener(self):
+        if self.estado_ui in ("viendo", "terminada"):
+            self.nueva_sesion()
+            return
         if self.conn is not None and self.en_curso:
+            if not self._confirmar_detener():
+                return
             self.conn.send({"cmd": "detener"})
             self.b_grabar.setEnabled(False)
+            self.b_pausa.setEnabled(False)
             self.lbl_estado.setText("◌ Deteniendo…")
             return
         self.iniciar()
+
+    def _confirmar_detener(self):
+        caja = QMessageBox(self)
+        caja.setIcon(QMessageBox.Icon.Warning)
+        caja.setWindowTitle("Detener la sesión")
+        caja.setText(f"¿Detener la sesión «{self.lbl_etiqueta.text()}»?")
+        caja.setInformativeText("Detener es final: la sesión queda guardada, pero no se puede continuar. "
+                                "Si solo necesitas parar un rato, usa «Pausar».")
+        detener = caja.addButton("Detener la sesión", QMessageBox.ButtonRole.DestructiveRole)
+        cancelar = caja.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        caja.setDefaultButton(cancelar)
+        caja.exec()
+        return caja.clickedButton() is detener
+
+    def pausar_o_reanudar(self):
+        if self.conn is None or not self.en_curso:
+            return
+        try:
+            self.conn.send({"cmd": "reanudar" if self.estado_ui == "pausada" else "pausar"})
+        except Exception:
+            return
+        self.b_pausa.setEnabled(False)   # se vuelve a habilitar con el próximo estado del motor
+
+    # ------------------------------------------------------------------ sesiones
+    def _sin_motor(self):
+        """No hay ninguna grabación en curso: se abre donde se quedó, en la última sesión."""
+        if sesiones.es_sesion(self.ultima_sesion):
+            self.abrir_sesion(self.ultima_sesion, al_inicio=True)
+        else:
+            self._modo_nueva(revisar=True)
+
+    def _modo_nueva(self, revisar=False):
+        self.carpeta_sesion = None
+        self.statusBar().showMessage("Sin motor")
+        self._poner_estado("detenido")
+        self.tabs.setCurrentWidget(self.pestana_config)
+        if revisar:
+            QTimer.singleShot(400, self.pestana_chequeo.revisar)
+
+    def nueva_sesion(self):
+        """Prepara una sesión nueva con los mismos ajustes de la que se está viendo, con un nombre libre."""
+        self.pestana_vivo.limpiar()
+        self.lbl_tiempo.setText("")
+        self._poner_nombre("")
+        base = self.pestana_config.carpeta.text().strip()
+        self.pestana_config._sugerir_etiqueta()
+        self.pestana_config.etiqueta.setText(sesiones.nombre_libre(base, self.pestana_config.etiqueta.text()))
+        self._modo_nueva()
+        self.guardar_config()
+        QTimer.singleShot(200, self.pestana_chequeo.revisar)
+
+    def elegir_sesion(self):
+        base = self.pestana_config.carpeta.text().strip() or self.plantilla.carpeta_salida
+        d = DialogoSesiones(self, base, self.carpeta_sesion)
+        if d.exec() == QDialog.DialogCode.Accepted and d.elegida:
+            self.abrir_sesion(d.elegida)
+
+    def abrir_sesion(self, carpeta, al_inicio=False):
+        """Muestra una sesión guardada. Se reconstruye desde sus archivos, sin su audio, en otro hilo."""
+        self.statusBar().showMessage("Abriendo la sesión…")
+        self.b_sesiones.setEnabled(False)
+        Tarea(sesiones.reconstruir, carpeta).iniciar(
+            self._sesion_abierta, lambda msg: self._abrir_fallo(carpeta, msg, al_inicio))
+
+    def _sesion_abierta(self, snap):
+        self.b_sesiones.setEnabled(True)
+        if self.grabando():   # mientras se abría, la ventana se conectó a una grabación
+            return
+        nombre = snap["cerrada"]["nombre"]
+        self.carpeta_sesion = snap["carpeta"]
+        self.pestana_vivo.mostrar_sesion(snap)
+        self.pestana_config.mostrar(snap["config"])
+        self._poner_nombre(nombre)
+        self.lbl_tiempo.setText(hms(snap["estado"]["segundos"]))
+        self._poner_estado("viendo")
+        self._recordar_sesion(snap["carpeta"])
+        self.tabs.setCurrentWidget(self.pestana_vivo)
+        self.pestana_vivo.sucio = True
+        self.pestana_vivo.redibujar()
+        self.statusBar().showMessage(f"Sesión «{nombre}» · {snap['carpeta']}")
+
+    def _abrir_fallo(self, carpeta, msg, al_inicio):
+        self.b_sesiones.setEnabled(True)
+        self.statusBar().clearMessage()
+        if al_inicio and not self.grabando():
+            self.ultima_sesion = ""
+            self._modo_nueva(revisar=True)
+        QMessageBox.warning(self, "No pude abrir la sesión", f"{carpeta}\n\n{msg}")
 
     def iniciar(self):
         self.guardar_config()
@@ -1053,6 +1358,25 @@ class Ventana(QMainWindow):
                 return
         if not cfg.etiqueta:
             self.pestana_config._sugerir_etiqueta()
+            self.guardar_config()
+            cfg = self.cfg
+        nombre = sistema.limpiar_nombre(cfg.etiqueta)
+        if os.path.exists(os.path.join(cfg.carpeta_salida, nombre)):
+            libre = sesiones.nombre_libre(cfg.carpeta_salida, nombre)
+            caja = QMessageBox(self)
+            caja.setIcon(QMessageBox.Icon.Question)
+            caja.setWindowTitle("Ya existe una sesión con ese nombre")
+            caja.setText(f"Ya hay una sesión llamada «{nombre}» en esa carpeta.")
+            caja.setInformativeText("Una sesión terminada no se puede continuar: cada grabación necesita su "
+                                    "propio nombre.")
+            crear = caja.addButton(f"Crear «{libre}»", QMessageBox.ButtonRole.AcceptRole)
+            caja.addButton("Cambiar el nombre", QMessageBox.ButtonRole.RejectRole)
+            caja.exec()
+            if caja.clickedButton() is not crear:
+                self.tabs.setCurrentWidget(self.pestana_config)
+                self.pestana_config.etiqueta.setFocus()
+                return
+            self.pestana_config.etiqueta.setText(libre)
             self.guardar_config()
             cfg = self.cfg
         datos = asdict(cfg)
@@ -1087,6 +1411,15 @@ class Ventana(QMainWindow):
                 return
             except Exception:
                 pass
+        elif self.proc is None:
+            # El aviso de la grabación a la que había que conectarse ya no está: terminó mientras
+            # tanto (por ejemplo, se cerró justo antes de abrir la app). No queda a qué conectarse.
+            self.esperando = None
+            if self.en_curso and not self.recibio_fin:
+                self._terminar("el motor se cerró inesperadamente; revisa registro.log en la carpeta de la sesión")
+            else:
+                self._sin_motor()
+            return
         if self.proc is not None and self.proc.poll() is not None:
             self.esperando = None
             err = ""
@@ -1110,7 +1443,8 @@ class Ventana(QMainWindow):
             self.carpeta_sesion = m.get("carpeta")
             self.pestana_vivo.reiniciar(m)
             self.pestana_config.mostrar(m.get("config") or {})
-            self._poner_estado("grabando")
+            self._poner_estado("pausada" if (m.get("estado") or {}).get("pausado") else "grabando")
+            self._recordar_sesion(self.carpeta_sesion)
             self.tabs.setCurrentWidget(self.pestana_vivo)
             if m.get("estado"):
                 # al reconectarse, la escucha se toma del motor: es el único momento en que la
@@ -1125,6 +1459,8 @@ class Ventana(QMainWindow):
                 self._estado(m["estado"])
         elif tipo == "estado":
             self._estado(m)
+        elif tipo == "pausas":
+            self.pestana_vivo.poner_pausas(m.get("pausas"))
         elif tipo == "curva":
             self.pestana_vivo.agregar_puntos(m.get("puntos", []))
         elif tipo == "pista":
@@ -1142,7 +1478,17 @@ class Ventana(QMainWindow):
     def _estado(self, e):
         self.ult_estado = e
         self.lbl_tiempo.setText(hms(e.get("segundos")))
-        self.lbl_etiqueta.setText(e.get("etiqueta", ""))
+        self._poner_nombre(e.get("etiqueta", ""))
+        if self.en_curso:
+            pausado = bool(e.get("pausado"))
+            if pausado and self.estado_ui == "grabando":
+                self._poner_estado("pausada")
+            elif not pausado and self.estado_ui == "pausada":
+                self._poner_estado("grabando")
+            if pausado:
+                self.lbl_estado.setText(f"⏸ En pausa · {mmss(e.get('pausa_s') or 0)}")
+            if self.estado_ui in ("grabando", "pausada"):
+                self.b_pausa.setEnabled(True)
         self.pestana_vivo.actualizar(e)
         alertas = e.get("alertas") or []
         self.lbl_alertas.setText("\n".join(f"⚠  {a}" for a in alertas))
@@ -1162,6 +1508,9 @@ class Ventana(QMainWindow):
             return
         if self.en_curso and not self.recibio_fin:
             self._terminar("el motor se cerró inesperadamente; revisa registro.log en la carpeta de la sesión")
+        elif not self.en_curso and self.estado_ui == "conectando":
+            # Se conectó a una grabación que justo se estaba cerrando y nunca llegó a mostrarla.
+            self._sin_motor()
 
     def _terminar(self, motivo):
         self.en_curso = False
@@ -1177,16 +1526,27 @@ class Ventana(QMainWindow):
         self.statusBar().showMessage(f"Grabación terminada: {motivo}")
 
     def _poner_estado(self, estado, motivo=""):
+        self.estado_ui = estado
         textos = {"detenido": ("○ Sin grabar", GRIS), "iniciando": ("◌ Iniciando…", AMARILLO),
                   "conectando": ("◌ Conectando con la grabación en curso…", AMARILLO),
-                  "grabando": ("● Grabando", ROJO), "terminada": ("■ Terminada", GRIS)}
+                  "grabando": ("● Grabando", ROJO), "pausada": ("⏸ En pausa", AMARILLO),
+                  "terminada": ("■ Terminada", GRIS), "viendo": ("▣ Sesión guardada", GRIS)}
         txt, color = textos[estado]
         self.lbl_estado.setText(txt + (f" ({motivo})" if motivo and estado == "terminada" else ""))
         self.lbl_estado.setStyleSheet(f"color:{color}")
-        activo = estado in ("iniciando", "conectando", "grabando")
-        self.b_grabar.setText("■  Detener" if activo else "▶  Iniciar grabación")
-        self.b_grabar.setEnabled(estado in ("detenido", "terminada", "grabando"))
-        self.pestana_config.bloquear(activo)
+        activo = estado in ("iniciando", "conectando", "grabando", "pausada")
+        solo_lectura = estado in ("viendo", "terminada")
+        self.b_grabar.setText("■  Detener" if activo else ("+  Nueva sesión" if solo_lectura else "▶  Iniciar grabación"))
+        self.b_grabar.setEnabled(estado in ("detenido", "terminada", "viendo", "grabando", "pausada"))
+        self.b_pausa.setVisible(activo)
+        self.b_pausa.setEnabled(estado in ("grabando", "pausada"))
+        self.b_pausa.setText("▶  Reanudar" if estado == "pausada" else "⏸  Pausar")
+        self.b_sesiones.setEnabled(not activo)
+        self.pestana_config.bloquear(
+            activo or solo_lectura,
+            "Grabación en curso: la configuración queda fija hasta que termine. Solo se puede cambiar «Escuchar»."
+            if activo else "Sesión guardada: su configuración es de solo lectura. Con «Nueva sesión» puedes "
+                           "grabar otra con estos mismos ajustes.")
         self.pestana_chequeo.bloquear(activo)
 
     # ------------------------------------------------------------------ escucha
@@ -1215,7 +1575,7 @@ class Ventana(QMainWindow):
             caja.setText("La grabación corre aparte de esta ventana: puede seguir aunque la cierres, y al "
                          "volver a abrir Loudness Lab te reconectas a ella.")
             seguir = caja.addButton("Cerrar la ventana y seguir grabando", QMessageBox.ButtonRole.AcceptRole)
-            detener = caja.addButton("Detener la grabación y cerrar", QMessageBox.ButtonRole.DestructiveRole)
+            detener = caja.addButton("Detener la sesión (es final) y cerrar", QMessageBox.ButtonRole.DestructiveRole)
             caja.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
             caja.exec()
             b = caja.clickedButton()

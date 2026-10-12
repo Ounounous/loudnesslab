@@ -10,6 +10,7 @@ import datetime as dt
 import json
 import logging
 import os
+import queue
 import threading
 import time
 
@@ -137,10 +138,16 @@ class HiloMetadata(threading.Thread):
         self.intervalo = intervalo
         self.detener = threading.Event()
         self.errores = 0
+        self.marcas = queue.Queue()
 
-    def _registrar(self, w, f, evento, info):
-        fg, arch, fa = self.obtener_posicion()
-        fila = {"hora_pc": ahora_iso(), "frame_global": fg, "archivo": arch,
+    def marcar(self, evento, posicion):
+        """Pide anotar «pausa» o «reanuda» en la posición dada (la del momento de la orden: el hilo
+        la escribe unas décimas después, cuando el audio ya pudo avanzar)."""
+        self.marcas.put((evento, ahora_iso(), posicion))
+
+    def _registrar(self, w, f, evento, info, posicion=None, hora=None):
+        fg, arch, fa = posicion or self.obtener_posicion()
+        fila = {"hora_pc": hora or ahora_iso(), "frame_global": fg, "archivo": arch,
                 "frame_en_archivo": fa, "evento": evento, **info}
         w.writerow(fila)
         f.flush()
@@ -160,7 +167,21 @@ class HiloMetadata(threading.Thread):
             loop = asyncio.new_event_loop()
             mgr = None
             ultimo = "inicio"
+            en_pausa = False
             while not self.detener.is_set():
+                # Las marcas van primero: lo que se lea después ya es posterior a ellas.
+                while True:
+                    try:
+                        evento, hora, pos = self.marcas.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._registrar(w, f, evento, {}, pos, hora)
+                    en_pausa = evento == "pausa"
+                    if not en_pausa:
+                        ultimo = "inicio"   # al reanudar se vuelve a anotar qué canción suena
+                if en_pausa:
+                    self.detener.wait(self.intervalo)
+                    continue
                 try:
                     if mgr is None:
                         mgr = loop.run_until_complete(Manager.request_async())
@@ -195,18 +216,36 @@ class HiloSimulado(threading.Thread):
         self.ruta_avisos = ruta_avisos
         self.al_evento = al_evento
         self.detener = threading.Event()
+        self.marcas = queue.Queue()
+
+    def marcar(self, evento, posicion):
+        self.marcas.put((evento, ahora_iso(), posicion))
 
     def run(self):
         leidas = 0
+        en_pausa = False
         with open(self.ruta, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=CAMPOS)
             w.writeheader()
             while not self.detener.is_set():
+                while not self.marcas.empty():
+                    evento, hora, (fg, arch, fpos) = self.marcas.get_nowait()
+                    fila = {"hora_pc": hora, "frame_global": fg, "archivo": arch, "frame_en_archivo": fpos,
+                            "evento": evento}
+                    w.writerow(fila)
+                    f.flush()
+                    en_pausa = evento == "pausa"
+                    if self.al_evento:
+                        self.al_evento(fila)
                 try:
                     with open(self.ruta_avisos, encoding="utf-8") as fa:
                         lineas = [x for x in fa.read().splitlines() if x.strip()]
                 except OSError:
                     lineas = []
+                if en_pausa:   # los avisos que lleguen en pausa se descartan, como el audio
+                    leidas = len(lineas)
+                    time.sleep(0.1)
+                    continue
                 for linea in lineas[leidas:]:
                     d = json.loads(linea)
                     fg, arch, fpos = self.obtener_posicion()

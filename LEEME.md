@@ -20,10 +20,19 @@ La grabación corre en un proceso aparte: **cerrar la ventana no la detiene**, y
 
 Los números en vivo usan exactamente la misma medición que `analizar.py`; el análisis final sigue siendo el de la sección 5.
 
+### Sesiones, pausar y detener
+- **El nombre de la sesión es el de su carpeta** (`<carpeta de salida>\<nombre>`, sin fecha). Si ya existe, la app ofrece crear `<nombre>_2` o cambiar el nombre.
+- **Pausar / Reanudar** (botón junto a «Detener») es para una pausa momentánea. Mientras dura, el audio **no se graba ni se mide**: lo que suene en ese rato no entra al experimento, y el reloj de la grabación no avanza. La sesión sigue en la misma carpeta. En el gráfico queda un hueco, y la canción que suena al reanudar se marca «empezó tras una pausa»: llega empezada, no se compara con la de antes de la pausa (no genera salto) y no se junta con ella. Si cierras la ventana en pausa, al volver a abrir la app se reconecta y sigue en pausa.
+- **Detener es final.** Antes de detener, la app avisa. Una sesión detenida se guarda completa y se puede abrir, pero **no se puede continuar**: para otra grabación se crea una sesión nueva.
+- **Sesiones…** (arriba) lista las sesiones de la carpeta de salida, con «Otra carpeta…» para abrir una que esté en otro lugar. Abrir una sesión muestra su gráfico, canciones, promedios, registro y la configuración con que se grabó (solo lectura), reconstruidos desde `mediciones.f32` y `pistas.csv` con la misma medición de la grabación, sin necesitar el audio. **«Nueva sesión»** parte con esos mismos ajustes y un nombre libre.
+- **Al abrir la app** vuelve a la última sesión que tuviste abierta (o se conecta a la grabación en curso, si la hay).
+
 ### Qué deja cada sesión
 Lo mismo que el script (WAV por hora, `pistas.csv`, `reloj.csv`, `sesion.json`), más:
 - `mediciones.f32`: por cada bloque de 100 ms, energía K-ponderada por canal, pico de muestra y true peak. Con esto se recalcula cualquier métrica sin el audio.
 - `registro.log`: lo mismo que el registro de la ventana.
+- En `pistas.csv`, las filas `pausa` y `reanuda` (mismo frame) marcan cada pausa. `sesion.json` trae la configuración completa (`config`), las pausas (`pausas`, con su duración) y `segundos_en_pausa`. `analizar.py` las entiende: corta la canción en la pausa, no calcula saltos a través de ella, y en `curva_100ms.csv` la hora real descuenta el tiempo pausado (el audio no lo incluye, el reloj sí).
+- `picos/` y `picos.csv`: un recorte de 20 s por cada cambio de canción con un salto notorio (Configuración › Umbrales › «Marcar saltos desde», 3 LU por defecto, sube o baja): los últimos 10 s de la canción que terminó y los primeros 10 s de la que empezó, que son los tramos con que se mide el salto. El corte cae en el segundo 10 del recorte. El nombre lleva el número, la hora aproximada, el salto y los títulos (`0001_155413_+7.0LU_Beck - Loser_a_Olly Murs….wav`); si la ruta es muy larga, queda solo con número, hora y salto. `picos.csv` trae el detalle (títulos, LUFS de cada tramo, posición exacta en la grabación). El recorte aparece unos 30 s después del cambio, cuando la canción nueva cumple la duración mínima: una canción más corta no cuenta como cambio y no deja recorte. Son copias, la grabación completa queda intacta. Ocupan ~7 MB cada uno.
 
 ### Si algo falla
 `registro.log` de la sesión, y en `%APPDATA%\LoudnessLab\`: `motor.log` (arranque del motor) y `caidas.log` (traza si el proceso se cae).
@@ -84,6 +93,13 @@ Con más de una sesión, `comparacion/` trae la tabla y el gráfico lado a lado.
 - **Salto en transición**: diferencia entre los últimos 10 s de una canción y los primeros 10 s de la siguiente. Referencia aproximada: < 1 LU casi imperceptible, 2–3 LU se nota, > 4–5 LU alguien va a ir a tocar el volumen.
 - **True peak** sobre −1 dBTP: riesgo de distorsión en el parlante o en la conversión.
 - **LRA**: dinámica interna de la canción (canciones con LRA alto tienen partes muy bajas y muy altas aunque su promedio sea "normal").
+
+## Verificar que la medición es correcta
+`verificar_medicion.py` pasa el **EBU loudness test set** (se baja de https://tech.ebu.ch/loudness y se descomprime en cualquier carpeta) por el mismo camino de medición que la grabación en vivo y compara con las tablas de EBU Tech 3341 y 3342. Además comprueba que medir en trozos o de una vez da lo mismo, que el medidor en vivo coincide con el análisis, y compara contra `ffmpeg` (filtro `ebur128`) con los programas del set y con los WAV que le pases en `--comparar`:
+```
+.venv\Scripts\python.exe verificar_medicion.py C:\ruta\al\set --comparar sesion.wav --salida informe.txt
+```
+Termina con código 1 si algo falla sin explicación. Los casos 13 y 14 (momentary de tonos de 400 ms) fallan a propósito de cómo está construida la medición: todo se calcula en bloques de 100 ms, y un tono corto que no empieza en esa rejilla se lee hasta 0,46 dB más bajo. El integrado y el LRA, que es lo que usa el experimento, pasan. Esto valida el algoritmo; para validar la cadena completa (app → cable → captura) hay que reproducir un archivo local por el cable y compararlo con `ffmpeg`.
 
 ## Notas técnicas
 - Medición validada: los coeficientes del filtro K son los exactos de BS.1770 y un tono de 1 kHz a 0 dBFS en un canal mide −3,00 LUFS (referencia −3,01).

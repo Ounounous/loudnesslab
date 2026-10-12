@@ -39,6 +39,8 @@ class Config:
     alerta_silencio_min: float = 2.0
     min_dur: float = 30.0
     checklist: dict = field(default_factory=dict)
+    # la sesión con la que se abre la app (carpeta); no es parte de lo que se graba
+    ultima_sesion: str = ""
 
 
 def _ruta():

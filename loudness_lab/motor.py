@@ -35,6 +35,7 @@ import numpy as np
 from . import VERSION, dispositivos, protocolo, sistema
 from .bs1770 import MedidorBloques
 from .metadata import HiloMetadata, HiloSimulado
+from .picos import SEG_ANTES, SEG_DESPUES, GuardaPicos
 from .seguimiento import Seguidor, Serie
 
 SEG_POR_ARCHIVO = 3600
@@ -349,10 +350,15 @@ class HandlerVentana(logging.Handler):
 class Motor:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.etiqueta = sistema.limpiar_nombre(cfg.get("etiqueta") or "sesion")
+        # El nombre de la sesión es el de su carpeta. Sin nombre, se usa la fecha para no chocar.
+        self.etiqueta = sistema.limpiar_nombre(cfg.get("etiqueta") or f"sesion_{dt.datetime.now():%Y%m%d_%H%M%S}")
         base = Path(cfg.get("carpeta_salida") or sistema.carpeta_salida_por_defecto())
-        self.carpeta = str(base / f"{self.etiqueta}_{dt.datetime.now():%Y%m%d_%H%M%S}")
-        os.makedirs(self.carpeta, exist_ok=False)
+        self.carpeta = str(base / self.etiqueta)
+        try:
+            os.makedirs(self.carpeta, exist_ok=False)
+        except FileExistsError:
+            raise FileExistsError(f"Ya existe una sesión llamada «{self.etiqueta}» en {base}. Una sesión "
+                                  "detenida no se puede continuar: elige otro nombre.") from None
         self.cola_audio = queue.Queue()
         self.cola_eventos = queue.Queue()
         self.publicador = Publicador()
@@ -373,6 +379,23 @@ class Motor:
         self.libre_gb = float("nan")
         self.stream = self.stream_silencio = None
         self.silenciar_hasta = 0
+        # Pausa: la captura sigue abierta pero el audio se descarta (ni se escribe ni se mide, y los
+        # frames no avanzan). Cada pausa queda en pausas y como eventos «pausa»/«reanuda» en pistas.csv.
+        self.pausado = False
+        self.pausa_desde = None
+        self.pausa_total = 0.0     # segundos pausados, sin contar la pausa en curso
+        self.pausas = []
+
+    def _en_pausa_s(self):
+        return time.time() - self.pausa_desde if self.pausado else 0.0
+
+    def _segundos_pausados(self):
+        return self.pausa_total + self._en_pausa_s()
+
+    def _pausas_gui(self):
+        """[segundo de audio donde empezó, cuánto duró] de cada pausa (la actual, lo que lleva)."""
+        return [[p["t_s"], p["duracion_s"] if p["duracion_s"] is not None else self._en_pausa_s()]
+                for p in self.pausas]
 
     # ------------------------------------------------------------------ arranque
     def ejecutar(self):
@@ -392,6 +415,7 @@ class Motor:
         self.medidor = MedidorBloques(self.sr, self.ch)
         self.seguidor = Seguidor(min_dur=float(cfg.get("min_dur", 30)), refinar_s=3.0,
                                  umbral_salto=float(cfg.get("umbral_salto", 3.0)))
+        self.picos = GuardaPicos(self.carpeta, self.sr, float(cfg.get("min_dur", 30)))
         self.f_bloques = open(os.path.join(self.carpeta, "mediciones.f32"), "ab")
         self.f_reloj = open(os.path.join(self.carpeta, "reloj.csv"), "a", newline="", encoding="utf-8")
         self.w_reloj = csv.writer(self.f_reloj)
@@ -400,10 +424,14 @@ class Motor:
         self.sesion = {
             "app": f"Loudness Lab {VERSION}",
             "etiqueta": self.etiqueta, "notas": cfg.get("notas", ""),
+            "config": {k: v for k, v in cfg.items() if not k.startswith("_") and k != "ultima_sesion"},
             "condiciones": {k: cfg.get(k, "") for k in ("fuente", "playlist", "normalizacion", "crossfade", "calidad")},
             "inicio_pc": ahora_iso(), "dispositivo": nombre, "sample_rate": self.sr, "canales": self.ch,
             "formato": "WAV float32", "segundos_por_archivo": SEG_POR_ARCHIVO, "filtro_app": cfg.get("app", ""),
             "umbrales": {k: cfg.get(k) for k in ("umbral_salto", "alerta_silencio_min", "min_dur")},
+            "picos": {"carpeta": "picos", "indice": "picos.csv", "segundos_antes": SEG_ANTES,
+                      "segundos_despues": SEG_DESPUES,
+                      "nota": "un recorte por cada cambio de canción con |salto| sobre umbral_salto"},
             "checklist": cfg.get("checklist", {}), "prueba_cadena": cfg.get("prueba_cadena"),
             "equipo": {"windows": platform.platform(), "nombre": platform.node()},
             "mediciones": {"archivo": "mediciones.f32", "tipo": "float32", "bloque_ms": 100,
@@ -510,7 +538,6 @@ class Motor:
         cfg = self.cfg
         self.t0 = time.time()
         horas = float(cfg.get("horas") or 0)
-        fin = self.t0 + horas * 3600 if horas > 0 else None
         self.ult_dato = time.time()
         ult_estado = ult_seg = 0.0
         ult_min = time.time()
@@ -528,6 +555,7 @@ class Motor:
             self._procesar_conexiones()
             self._procesar_comandos()
             self._publicar_pistas()
+            self._guardar_picos()
             if ahora - ult_seg >= 1:
                 self._cada_segundo()
                 ult_seg = ahora
@@ -537,7 +565,7 @@ class Motor:
             if ahora - ult_min >= 60:
                 self._cada_minuto()
                 ult_min = ahora
-            if fin and ahora >= fin:
+            if horas > 0 and ahora - self.t0 - self._segundos_pausados() >= horas * 3600:
                 self.motivo_fin = "se cumplió la duración configurada"
                 break
 
@@ -554,11 +582,15 @@ class Motor:
 
     def _procesar_audio(self, datos):
         bloque = np.frombuffer(b"".join(datos), dtype=np.float32).reshape(-1, self.ch)
+        if self.pausado:   # el audio de una pausa no entra al experimento; la escucha sigue
+            self.monitor.alimentar(bloque)
+            return
         inicio = self.escritor.frame_global
         if inicio < self.silenciar_hasta:
             bloque = bloque.copy()
             bloque[:self.silenciar_hasta - inicio] = 0.0
         self.escritor.escribir(bloque)
+        self.picos.alimentar(inicio, bloque)
         self.monitor.alimentar(bloque)
         self._medir(*self.medidor.procesar(bloque))
 
@@ -585,6 +617,8 @@ class Motor:
             b = int(e.get("frame_global") or 0) // self.blk
             self.seguidor.evento(e, b)
             ev = e.get("evento")
+            if ev in ("pausa", "reanuda"):
+                continue
             if ev == "sin_sesion":
                 self.estado_app = ""
                 if self.sin_meta_desde is None:
@@ -609,6 +643,18 @@ class Motor:
                 log.info(txt)
         self.seguidor.nuevas = []
 
+    def _guardar_picos(self):
+        """Un fallo al guardar un recorte no debe afectar a la grabación: solo se avisa."""
+        for e in self.seguidor.saltos_notorios:
+            try:
+                fila = self.picos.guardar(e, self.t0)
+            except Exception as ex:
+                log.warning("No pude guardar el recorte del salto de %+.1f LU: %s", e["salto"], ex)
+                continue
+            if fila:
+                log.info("Salto de %+.1f LU: recorte guardado en picos\\%s", e["salto"], fila["archivo"])
+        self.seguidor.saltos_notorios = []
+
     def _procesar_conexiones(self):
         while True:
             try:
@@ -628,6 +674,10 @@ class Motor:
                 self.motivo_fin = "detenida desde la ventana"
                 log.info("Deteniendo a pedido de la ventana...")
                 self.detener.set()
+            elif cmd == "pausar":
+                self._pausar()
+            elif cmd == "reanudar":
+                self._reanudar()
             elif cmd == "monitor":
                 if c.get("on"):
                     if self.monitor.stream is not None and c.get("dispositivo", "") == self.cfg.get("monitor_dispositivo", ""):
@@ -637,6 +687,29 @@ class Motor:
                         self.monitor.abrir(self.cfg["monitor_dispositivo"], float(c.get("vol", 0.5)))
                 else:
                     self.monitor.cerrar()
+
+    def _pausar(self):
+        if self.pausado:
+            return
+        pos = self.escritor.posicion()   # el audio no avanza desde acá: es el punto exacto de la pausa
+        self.pausado, self.pausa_desde = True, time.time()
+        self.pausas.append({"frame": pos[0], "t_s": pos[0] / self.sr, "hora_pausa": ahora_iso(),
+                            "hora_reanuda": None, "duracion_s": None})
+        self.meta.marcar("pausa", pos)
+        self.publicador.enviar({"tipo": "pausas", "pausas": self._pausas_gui()})
+        log.info("Grabación en pausa: el audio no se registra hasta que reanudes.")
+
+    def _reanudar(self):
+        if not self.pausado:
+            return
+        dur = time.time() - self.pausa_desde
+        self.pausa_total += dur
+        self.pausado = False
+        self.pausas[-1].update(hora_reanuda=ahora_iso(), duracion_s=dur)
+        self.sin_meta_desde = None   # la metadata vuelve a leerse desde cero
+        self.meta.marcar("reanuda", self.escritor.posicion())
+        self.publicador.enviar({"tipo": "pausas", "pausas": self._pausas_gui()})
+        log.info("Grabación reanudada tras %s de pausa.", f"{int(dur // 60)}:{int(dur % 60):02d}")
 
     # ------------------------------------------------------------------ periódicas
     def _alerta(self, codigo, activa, texto):
@@ -654,7 +727,11 @@ class Motor:
             self.curva_pend = []
         self.stats = self.seguidor.estadisticas()
         s = self.escritor.frame_global / self.sr
-        self.desfase = (time.time() - self.t0) - s
+        self.desfase = (time.time() - self.t0 - self._segundos_pausados()) - s
+        if self.pausado:   # en pausa no hay audio que vigilar
+            for codigo in ("silencio", "ruta", "metadata"):
+                self._alerta(codigo, False, "")
+            return
         sil = self.seguidor.silencio_bloques / 10
         lim = float(self.cfg.get("alerta_silencio_min") or 2) * 60
         self._alerta("silencio", s > 5 and sil >= lim, f"Sin música hace {sil / 60:.0f} min.")
@@ -686,7 +763,8 @@ class Motor:
             log.error("Queda muy poco espacio en disco: se detiene la grabación.")
             self.detener.set()
         if not primera:
-            log.info("%.2f h grabadas · desfase %+.2f s · pérdidas %d", s / 3600, self.desfase, self.overflows)
+            log.info("%.2f h grabadas · desfase %+.2f s · pérdidas %d%s", s / 3600, self.desfase, self.overflows,
+                     " · en pausa" if self.pausado else "")
 
     # ------------------------------------------------------------------ estado
     def _estado(self):
@@ -695,7 +773,9 @@ class Motor:
             "tipo": "estado", "grabando": not self.terminado,
             "segundos": self.escritor.frame_global / self.sr, "inicio_epoch": self.t0,
             "etiqueta": self.etiqueta, "carpeta": self.carpeta,
-            "momentary": seg.momentary(), "shortterm": seg.shortterm(),
+            "pausado": self.pausado, "pausa_s": self._en_pausa_s(), "pausado_total_s": self._segundos_pausados(),
+            "momentary": float("nan") if self.pausado else seg.momentary(),
+            "shortterm": float("nan") if self.pausado else seg.shortterm(),
             "pista": seg.pista_actual(), "estado_app": self.estado_app, "sesion": self.stats,
             "salud": {
                 "libre_gb": self.libre_gb, "horas_restantes": self.libre_gb / self.gb_hora,
@@ -711,14 +791,15 @@ class Motor:
     def _snapshot(self):
         return {"tipo": "snapshot", "version": VERSION, "config": self.cfg, "carpeta": self.carpeta,
                 "inicio_epoch": self.t0, "log": list(self.log_reciente),
-                "pistas": list(self.seguidor.cerradas[-500:]),
+                "pistas": list(self.seguidor.cerradas[-500:]), "pausas": self._pausas_gui(),
                 "curva_t": self.curva_t.v.copy(), "curva_st": self.curva_st.v.copy(),
                 "estado": self._estado()}
 
     def _guardar_sesion(self, fin=False):
         s = dict(self.sesion, archivos=self.escritor.archivos, frames_totales=self.escritor.frame_global,
                  segundos_totales=self.escritor.frame_global / self.sr, overflows=self.overflows,
-                 reaperturas=self.reaperturas, resumen_en_vivo=self.stats)
+                 reaperturas=self.reaperturas, resumen_en_vivo=self.stats, pausas=self.pausas,
+                 segundos_en_pausa=self._segundos_pausados())
         if fin:
             s["fin_pc"] = ahora_iso()
             s["motivo_fin"] = self.motivo_fin
@@ -736,10 +817,15 @@ class Motor:
             if not datos:
                 break
             self._procesar_audio(datos)
+        if self.pausado:   # se detuvo estando en pausa: la pausa queda con la duración que llevaba
+            self.pausas[-1]["duracion_s"] = self._en_pausa_s()
+            self.pausa_total += self._en_pausa_s()
+            self.pausado = False
         self._medir(*self.medidor.terminar())
         self._procesar_eventos()
         self.seguidor.terminar()
         self._publicar_pistas()
+        self._guardar_picos()
         self.meta.detener.set()
         self.meta.join(timeout=3)
         self.monitor.cerrar()
