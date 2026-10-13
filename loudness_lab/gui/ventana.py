@@ -22,11 +22,11 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QPushButton, QRadioButton, QScrollArea, QSlider, QSplitter, QTableWidget,
-                               QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+                               QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 import pyqtgraph as pg
 
-from .. import VERSION, protocolo, sesiones, sistema
+from .. import VERSION, excel, protocolo, sesiones, sistema
 from .. import config as cfgmod
 from ..config import APP_POR_FUENTE
 from ..seguimiento import Serie
@@ -185,6 +185,18 @@ class BarraLUFS(QWidget):
 # Pestaña: en vivo
 # ----------------------------------------------------------------------------
 COLUMNAS = ["Inicio", "Artista – Título", "Dur.", "LUFS", "LRA", "True peak", "Salto"]
+Y_MIN, Y_MAX = -45.0, 0.0     # el rango vertical con que se abre el gráfico
+AYUDA_ZOOM = ("Rueda del mouse: acercar o alejar el tiempo · Ctrl + rueda: acercar o alejar los LUFS\n"
+              "Arrastrar: mover el gráfico · Doble clic: restablecer la vista")
+
+
+class VistaTiempo(pg.ViewBox):
+    """La rueda acerca y aleja el tiempo (eje horizontal); con Ctrl, los LUFS (eje vertical)."""
+
+    def wheelEvent(self, ev, axis=None):
+        if axis is None:
+            axis = 1 if ev.modifiers() & Qt.KeyboardModifier.ControlModifier else 0
+        super().wheelEvent(ev, axis)
 
 
 class PestanaVivo(QWidget):
@@ -195,6 +207,10 @@ class PestanaVivo(QWidget):
         self.rango = "1 h"
         self.curva_t, self.curva_st = Serie(3600), Serie(3600)
         self.seg_cortes, self.seg_niveles = [], []
+        self.pistas = []   # todas las canciones cerradas de la sesión (la tabla muestra solo las últimas 1000)
+        self.stats_datos = {}
+        self.segundos = 0.0
+        self.manual = False   # el usuario movió o acercó el gráfico: deja de seguir el rango elegido
         self.pausas = []   # [segundo de audio donde empezó, duración] de cada pausa de la grabación
         self.sucio = False
 
@@ -219,12 +235,17 @@ class PestanaVivo(QWidget):
         arriba.addWidget(self.lbl_med)
 
         # gráfico
-        self.plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem(orientation="bottom")})
-        self.plot.setMouseEnabled(x=False, y=False)
+        self.plot = pg.PlotWidget(viewBox=VistaTiempo(), axisItems={"bottom": pg.DateAxisItem(orientation="bottom")})
+        self.vista = self.plot.getViewBox()
+        self.plot.setMouseEnabled(x=True, y=True)
         self.plot.hideButtons()
         self.plot.setMenuEnabled(False)
         self.plot.showGrid(x=True, y=True, alpha=0.18)
-        self.plot.setYRange(-45, 0, padding=0)
+        self.plot.setYRange(Y_MIN, Y_MAX, padding=0)
+        self.vista.setLimits(yMin=-75, yMax=10, minYRange=3, minXRange=20)
+        self.vista.sigRangeChangedManually.connect(self._movido_a_mano)
+        self.plot.scene().sigMouseClicked.connect(self._clic_grafico)
+        self.plot.setToolTip(AYUDA_ZOOM)
         self.plot.setLabel("left", "LUFS")
         self.plot.setMinimumHeight(170)
         self.cortes = self.plot.plot(pen=pg.mkPen((140, 140, 140, 110), width=1), connect="pairs")
@@ -243,6 +264,22 @@ class PestanaVivo(QWidget):
         rangos = QHBoxLayout()
         rangos.addWidget(leyenda)
         rangos.addStretch()
+        for texto, eje in (("Tiempo", 0), ("LUFS", 1)):
+            rangos.addWidget(QLabel(texto))
+            for signo, factor in (("−", 2.0), ("+", 0.5)):
+                b = QToolButton()
+                b.setText(signo)
+                b.setFixedWidth(26)
+                b.setToolTip(f"{'Acercar' if factor < 1 else 'Alejar'} {'el tiempo' if eje == 0 else 'los LUFS'}\n{AYUDA_ZOOM}")
+                b.clicked.connect(lambda _=False, eje=eje, factor=factor: self._zoom(eje, factor))
+                rangos.addWidget(b)
+            rangos.addSpacing(6)
+        self.b_restablecer = QPushButton("Restablecer vista")
+        self.b_restablecer.setToolTip("Vuelve al rango elegido (1 h, 6 h o toda la sesión) y a la escala vertical inicial. "
+                                      "En una grabación en curso, el gráfico vuelve a seguir lo último que se mide.")
+        self.b_restablecer.clicked.connect(self.restablecer_vista)
+        rangos.addWidget(self.b_restablecer)
+        rangos.addSpacing(10)
         self.grupo_rango = QButtonGroup(self)
         for r in ("1 h", "6 h", "Toda"):
             b = QRadioButton(r)
@@ -387,6 +424,11 @@ class PestanaVivo(QWidget):
         self.curva_t.agregar(snap.get("curva_t", []))
         self.curva_st.agregar(snap.get("curva_st", []))
         self.seg_cortes, self.seg_niveles = [], []
+        self.pistas = []
+        self.stats_datos = {}
+        self.segundos = float((snap.get("estado") or {}).get("segundos") or 0)
+        self.manual = False
+        self.plot.setYRange(Y_MIN, Y_MAX, padding=0)
         self.tabla.setRowCount(0)
         for p in snap.get("pistas", []):
             self.agregar_pista(p)
@@ -405,9 +447,10 @@ class PestanaVivo(QWidget):
     def agregar_pista(self, p):
         if self.inicio_epoch is None:
             return
+        self.pistas.append(dict(p))
         x0 = float(self._a_reloj(p["inicio_s"], True))
         x1 = x0 + p["duracion_s"]
-        self.seg_cortes += [(x0, -45.0), (x0, 0.0)]
+        self.seg_cortes += [(x0, Y_MIN), (x0, Y_MAX)]
         if not vacio(p["lufs"]):
             self.seg_niveles += [(x0, p["lufs"]), (x1, p["lufs"])]
         self.sucio = True
@@ -448,6 +491,7 @@ class PestanaVivo(QWidget):
             self.registro.appendPlainText(linea)
 
     def _poner_stats(self, s):
+        self.stats_datos = dict(s or {})
         if not s:
             for lbl in self.stats.values():
                 lbl.setText("—")
@@ -467,6 +511,7 @@ class PestanaVivo(QWidget):
     def actualizar(self, e):
         p = e.get("pista")
         self.pista_actual = p
+        self.segundos = float(e.get("segundos") or self.segundos)
         pausado = bool(e.get("pausado"))
         if pausado:
             self.lbl_cancion.setText("Grabación en pausa")
@@ -509,8 +554,62 @@ class PestanaVivo(QWidget):
 
     def _cambiar_rango(self, r):
         self.rango = r
+        self.manual = False
         self.sucio = True
         self.redibujar()
+
+    # ------------------------------------------------------------------ zoom
+    def _movido_a_mano(self, *_):
+        self.manual = True
+
+    def _clic_grafico(self, ev):
+        if ev.double() and ev.button() == Qt.MouseButton.LeftButton \
+                and self.vista.sceneBoundingRect().contains(ev.scenePos()):
+            self.restablecer_vista()
+
+    def _zoom(self, eje, factor):
+        """Acerca (factor < 1) o aleja (factor > 1) un eje, alrededor del centro de lo que se ve."""
+        (x0, x1), (y0, y1) = self.vista.viewRange()
+        centro = pg.Point((x0 + x1) / 2, (y0 + y1) / 2)
+        self.vista.scaleBy(x=factor if eje == 0 else None, y=factor if eje == 1 else None, center=centro)
+        self.manual = True
+
+    def restablecer_vista(self):
+        """Vuelve al rango elegido (1 h, 6 h, toda) y a la escala vertical de siempre; en una
+        grabación en curso, el gráfico vuelve a seguir lo último."""
+        self.manual = False
+        self.plot.setYRange(Y_MIN, Y_MAX, padding=0)
+        self.sucio = True
+        self.redibujar()
+
+    # ------------------------------------------------------------------ exportar
+    def datos_exportacion(self, carpeta=None):
+        """Lo que va al Excel (ver excel.exportar). Las canciones y la curva son todas las de la sesión,
+        no solo las que caben en la tabla; el registro, el archivo completo de la sesión si está."""
+        t = self.curva_t.v.copy()
+        st = self.curva_st.v.copy()
+        epoch = self._a_reloj(t, False) if len(t) else np.zeros(0)
+        integrado = np.full(len(t), np.nan)
+        pistas = []
+        for p in self.pistas:
+            d = dict(p)
+            d["inicio_epoch"] = float(self._a_reloj(p["inicio_s"], True))
+            pistas.append(d)
+            if not vacio(p.get("lufs")) and len(t):
+                a = np.searchsorted(t, p["inicio_s"], side="right")
+                b = np.searchsorted(t, p["inicio_s"] + p["duracion_s"], side="right")
+                integrado[a:b] = p["lufs"]
+        registro = None
+        if carpeta:
+            try:
+                with open(os.path.join(carpeta, "registro.log"), encoding="utf-8", errors="replace") as f:
+                    registro = f.read()
+            except OSError:
+                pass
+        if registro is None:
+            registro = self.registro.toPlainText()
+        return {"inicio_epoch": self.inicio_epoch, "horas": self.segundos / 3600, "pistas": pistas,
+                "stats": dict(self.stats_datos), "curva": (epoch, t, st, integrado), "registro": registro}
 
     def redibujar(self):
         if not self.sucio or self.inicio_epoch is None:
@@ -542,8 +641,12 @@ class PestanaVivo(QWidget):
         else:
             self.nivel_actual.setData([], [])
         fin = x[-1] if len(x) else self.inicio_epoch + 60
-        ini = {"1 h": fin - 3600, "6 h": fin - 6 * 3600}.get(self.rango, self.inicio_epoch)
-        self.plot.setXRange(max(ini, self.inicio_epoch), max(fin, self.inicio_epoch + 60), padding=0.01)
+        # no se puede alejar más allá de lo que hay (con un margen)
+        margen = 0.02 * (fin - self.inicio_epoch) + 120
+        self.vista.setLimits(xMin=self.inicio_epoch - margen, xMax=max(fin, self.inicio_epoch + 60) + margen)
+        if not self.manual:
+            ini = {"1 h": fin - 3600, "6 h": fin - 6 * 3600}.get(self.rango, self.inicio_epoch)
+            self.plot.setXRange(max(ini, self.inicio_epoch), max(fin, self.inicio_epoch + 60), padding=0.01)
 
 
 def _html(s):
@@ -1138,6 +1241,12 @@ class Ventana(QMainWindow):
         self.b_sesiones.clicked.connect(self.elegir_sesion)
         self.b_carpeta = QPushButton("Abrir carpeta")
         self.b_carpeta.clicked.connect(self.abrir_carpeta)
+        self.b_excel = QPushButton("Descargar resultados")
+        self.b_excel.setToolTip("Guarda en un Excel: las canciones, los promedios de la sesión, los datos del "
+                                "gráfico de LUFS y el registro.")
+        self.b_excel.clicked.connect(self.descargar_resultados)
+        self.b_excel.setEnabled(False)
+        self.exportando = False
         self.chk_escuchar = QCheckBox("Escuchar")
         self.chk_escuchar.setToolTip("Reproduce en los parlantes lo que se graba. No afecta la medición.")
         self.chk_escuchar.setChecked(self.cfg.monitor)
@@ -1165,6 +1274,8 @@ class Ventana(QMainWindow):
         barra.addWidget(self.b_carpeta)
         barra.addWidget(self.b_pausa)
         barra.addWidget(self.b_grabar)
+        barra.addSpacing(14)
+        barra.addWidget(self.b_excel)
 
         self.lbl_alertas = QLabel("")
         self.lbl_alertas.setWordWrap(True)
@@ -1542,12 +1653,72 @@ class Ventana(QMainWindow):
         self.b_pausa.setEnabled(estado in ("grabando", "pausada"))
         self.b_pausa.setText("▶  Reanudar" if estado == "pausada" else "⏸  Pausar")
         self.b_sesiones.setEnabled(not activo)
+        self._habilitar_excel()
         self.pestana_config.bloquear(
             activo or solo_lectura,
             "Grabación en curso: la configuración queda fija hasta que termine. Solo se puede cambiar «Escuchar»."
             if activo else "Sesión guardada: su configuración es de solo lectura. Con «Nueva sesión» puedes "
                            "grabar otra con estos mismos ajustes.")
         self.pestana_chequeo.bloquear(activo)
+
+    # ------------------------------------------------------------------ resultados
+    def _habilitar_excel(self):
+        hay = self.estado_ui in ("grabando", "pausada", "viendo", "terminada") and self.pestana_vivo.inicio_epoch is not None
+        self.b_excel.setEnabled(hay and not self.exportando)
+
+    def descargar_resultados(self):
+        """Guarda lo que muestra la pestaña En vivo en un Excel de cuatro hojas (ver excel.py)."""
+        pv = self.pestana_vivo
+        if pv.inicio_epoch is None or self.exportando:
+            return
+        nombre = self.lbl_etiqueta.text() or "sesion"
+        carpeta = self.carpeta_sesion if self.carpeta_sesion and os.path.isdir(self.carpeta_sesion) \
+            else self.pestana_config.carpeta.text().strip()
+        sugerido = os.path.join(carpeta, f"{sistema.limpiar_nombre(nombre)} - resultados.xlsx")
+        ruta, _ = QFileDialog.getSaveFileName(self, "Descargar resultados", sugerido, "Libro de Excel (*.xlsx)")
+        if not ruta:
+            return
+        if not ruta.lower().endswith(".xlsx"):
+            ruta += ".xlsx"
+        d = pv.datos_exportacion(self.carpeta_sesion)
+        self.exportando = True
+        self._habilitar_excel()
+        self.statusBar().showMessage("Generando el Excel…")
+        Tarea(excel.exportar, ruta, nombre, d["inicio_epoch"], d["horas"], d["pistas"], d["stats"], d["curva"],
+              d["registro"]).iniciar(lambda r: self._excel_listo(ruta, r), lambda msg: self._excel_fallo(ruta, msg))
+
+    def _excel_listo(self, ruta, r):
+        self.exportando = False
+        self._habilitar_excel()
+        self.statusBar().showMessage(f"Resultados guardados en {ruta}")
+        caja = QMessageBox(self)
+        caja.setIcon(QMessageBox.Icon.Information)
+        caja.setWindowTitle("Resultados guardados")
+        caja.setText(f"Guardé el Excel en:\n{ruta}")
+        extra = []
+        if r["celdas_registro"] > 1:
+            extra.append(f"El registro es más largo de lo que cabe en una celda de Excel (32 767 caracteres): "
+                         f"sigue en las celdas A2 a A{r['celdas_registro']} de la hoja «Registro».")
+        if r["submuestreo"] > 1:
+            extra.append(f"La sesión es tan larga que la hoja «Data LUFS» tiene un punto cada {r['submuestreo']} s.")
+        if extra:
+            caja.setInformativeText("\n".join(extra))
+        abrir = caja.addButton("Abrir el Excel", QMessageBox.ButtonRole.AcceptRole)
+        caja.addButton("Cerrar", QMessageBox.ButtonRole.RejectRole)
+        caja.exec()
+        if caja.clickedButton() is abrir:
+            try:
+                sistema.abrir(ruta)
+            except OSError as e:
+                QMessageBox.warning(self, "No pude abrir el Excel", str(e))
+
+    def _excel_fallo(self, ruta, msg):
+        self.exportando = False
+        self._habilitar_excel()
+        self.statusBar().showMessage("No se pudo guardar el Excel")
+        detalle = "Si el archivo está abierto en Excel, ciérralo y vuelve a intentarlo." if "ermission" in msg \
+            or "denied" in msg else ""
+        QMessageBox.warning(self, "No pude guardar el Excel", f"{ruta}\n\n{msg}" + (f"\n\n{detalle}" if detalle else ""))
 
     # ------------------------------------------------------------------ escucha
     def cambiar_escucha(self, *_):
@@ -1632,13 +1803,18 @@ def main():
     v = Ventana()
     v.show()
     # Solo para revisión automática: LOUDNESS_CAPTURA="ruta.png|segundos[|pestaña]" guarda una imagen
-    # de la ventana y la cierra (sin detener el motor).
+    # de la ventana y la cierra (sin detener el motor). Con LOUDNESS_EXPORTAR="ruta.xlsx" guarda
+    # además el Excel de «Descargar resultados».
     captura = os.environ.get("LOUDNESS_CAPTURA")
     if captura:
         partes = captura.split("|")
         ruta, seg = partes[0], float(partes[1]) if len(partes) > 1 else 5
 
         def capturar():
+            if os.environ.get("LOUDNESS_EXPORTAR"):
+                d = v.pestana_vivo.datos_exportacion(v.carpeta_sesion)
+                excel.exportar(os.environ["LOUDNESS_EXPORTAR"], v.lbl_etiqueta.text(), d["inicio_epoch"], d["horas"],
+                               d["pistas"], d["stats"], d["curva"], d["registro"])
             if len(partes) > 2:
                 v.tabs.setCurrentIndex(int(partes[2]))
                 QApplication.processEvents()

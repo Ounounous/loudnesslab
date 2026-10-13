@@ -10,3 +10,4 @@ winrt-Windows.Foundation.Collections
 # ventana de la app (Loudness Lab)
 PySide6
 pyqtgraph
+xlsxwriter

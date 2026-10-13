@@ -27,6 +27,20 @@ Los números en vivo usan exactamente la misma medición que `analizar.py`; el a
 - **Sesiones…** (arriba) lista las sesiones de la carpeta de salida, con «Otra carpeta…» para abrir una que esté en otro lugar. Abrir una sesión muestra su gráfico, canciones, promedios, registro y la configuración con que se grabó (solo lectura), reconstruidos desde `mediciones.f32` y `pistas.csv` con la misma medición de la grabación, sin necesitar el audio. **«Nueva sesión»** parte con esos mismos ajustes y un nombre libre.
 - **Al abrir la app** vuelve a la última sesión que tuviste abierta (o se conecta a la grabación en curso, si la hay).
 
+### Gráfico de LUFS: zoom
+- **Rueda del mouse**: acerca o aleja el tiempo, alrededor del puntero. **Ctrl + rueda**: acerca o aleja la escala de LUFS (útil para ver las diferencias de un par de LU entre canciones, que en la escala completa de −45 a 0 se aprietan).
+- **Arrastrar** mueve el gráfico. Los botones **Tiempo −/+** y **LUFS −/+** hacen lo mismo que la rueda. **Doble clic** o **Restablecer vista** vuelven a la vista inicial.
+- Con la grabación en curso, mientras el gráfico esté acercado o movido a mano **no se desplaza solo**: se queda en lo que estás mirando. «Restablecer vista» (o elegir 1 h / 6 h / Toda) vuelve a seguir lo último que se mide. No se puede acercar a menos de 20 s ni alejar más allá de la sesión.
+
+### Descargar resultados (Excel)
+El botón **Descargar resultados** (arriba a la derecha) guarda un `.xlsx` de la sesión que se está viendo o grabando, con cuatro hojas:
+1. **Últimas canciones**: todas las canciones de la sesión (no solo las últimas que caben en la tabla), de la primera a la última, con las mismas columnas de la tabla más una «Nota» (corta / empezó tras una pausa). Los números son números, con filtros, y los saltos y true peak sobre el umbral van marcados como en la ventana. Un true peak en blanco es silencio digital.
+2. **Promedios de la sesión**: el panel de la ventana, un valor por celda con su unidad, más el nombre, el inicio y las horas grabadas.
+3. **Data LUFS**: los datos del gráfico, un punto por segundo de audio: hora, segundo de audio, short-term (3 s; −60 = silencio) y LUFS integrado de la canción en curso. Una pausa se nota como un salto en la hora.
+4. **Registro**: el `registro.log` completo de la sesión. Excel no admite más de 32 767 caracteres en una celda, así que un registro largo (una sesión de 13 h ocupa unos 100 000) empieza en **A1 y sigue en A2, A3…**, cortado entre líneas; la app avisa cuántas celdas ocupó.
+
+Por defecto se guarda en la carpeta de la sesión como `<sesión> - resultados.xlsx`, pero el diálogo deja elegir otro lugar. Si el archivo está abierto en Excel, avisa y no lo pisa.
+
 ### Qué deja cada sesión
 Lo mismo que el script (WAV por hora, `pistas.csv`, `reloj.csv`, `sesion.json`), más:
 - `mediciones.f32`: por cada bloque de 100 ms, energía K-ponderada por canal, pico de muestra y true peak. Con esto se recalcula cualquier métrica sin el audio.
