@@ -59,23 +59,32 @@ class GuardaPicos:
         self.blk = sr // 10
         self.carpeta = os.path.join(carpeta, "picos")
         self.indice = os.path.join(carpeta, "picos.csv")
-        self.n = 0
+        self.n = len(self.guardados())   # al retomar una sesión cortada, la numeración sigue
         # la canción nueva lleva min_dur s cuando se decide: desde su corte hay que poder volver 10 s
         self.retrovisor = Retrovisor(sr, max(min_dur, SEG_DESPUES) + SEG_ANTES + 30)
+
+    def guardados(self):
+        """Los recortes que ya están en picos.csv, por su posición (corte_s)."""
+        try:
+            with open(self.indice, encoding="utf-8", newline="") as f:
+                return {round(float(r["corte_s"]), 3) for r in csv.DictReader(f) if r.get("corte_s")}
+        except (OSError, ValueError, KeyError):
+            return set()
 
     def alimentar(self, inicio, x):
         self.retrovisor.agregar(inicio, x)
 
-    def guardar(self, e, t0_epoch):
-        """Guarda el recorte de un salto notorio (ver Seguidor._revisar_salto). Devuelve lo que
-        escribió en picos.csv, o None si el audio ya no estaba en memoria."""
+    def guardar(self, e, reloj):
+        """Guarda el recorte de un salto notorio (ver Seguidor._revisar_salto). `reloj(frame)` da la
+        hora (epoch) de un frame del audio. Devuelve lo que escribió en picos.csv, o None si el audio
+        ya no estaba en memoria."""
         import soundfile as sf
         corte = e["corte"] * self.blk
         audio, ini = self.retrovisor.extraer(corte - SEG_ANTES * self.sr, corte + SEG_DESPUES * self.sr)
         if audio is None:
             return None
         self.n += 1
-        hora = dt.datetime.fromtimestamp(t0_epoch + corte / self.sr).astimezone()
+        hora = dt.datetime.fromtimestamp(reloj(corte)).astimezone()
         corto = f"{self.n:04d}_{hora:%H%M%S}_{e['salto']:+.1f}LU.wav"
         largo = f"{corto[:-4]}_{limpiar_nombre(e['de'])[:30]}_a_{limpiar_nombre(e['a'])[:30]}.wav"
         os.makedirs(self.carpeta, exist_ok=True)

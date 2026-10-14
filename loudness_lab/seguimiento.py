@@ -110,9 +110,10 @@ class Seguidor:
     def evento(self, e, b):
         """Un aviso de la metadata en el bloque b (misma lógica que analizar.segmentar)."""
         b = max(0, min(int(b), self.n))
-        if e.get("evento") == "pausa":
-            # La grabación se pausó: lo que sigue no continúa lo anterior. La canción en curso se cierra
-            # acá y no se calcula ningún salto entre la de antes y la de después.
+        if e.get("evento") in ("pausa", "corte"):
+            # La grabación se pausó (o el motor se cortó y se retomó): lo que sigue no continúa lo
+            # anterior. La canción en curso se cierra acá y no se calcula ningún salto entre la de
+            # antes y la de después.
             if self.pendiente is not None:
                 self._resolver_pendiente()
             self._cortar(b, None, False)

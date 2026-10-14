@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 import pyqtgraph as pg
 
-from .. import VERSION, excel, protocolo, sesiones, sistema
+from .. import VERSION, excel, guardian, protocolo, sesiones, sistema
 from .. import config as cfgmod
 from ..config import APP_POR_FUENTE
 from ..seguimiento import Serie
@@ -396,12 +396,21 @@ class PestanaVivo(QWidget):
         self.reiniciar(snap)
         c = snap["cerrada"]
         inicio = dt.datetime.fromtimestamp(snap["inicio_epoch"]).strftime("%d-%m-%Y %H:%M")
-        estado = "terminada" if c["terminada"] else "interrumpida (la grabación no se cerró bien)"
+        if c["terminada"]:
+            estado = "terminada"
+        elif c.get("abierta"):
+            estado = "cortada: sigue abierta y se retoma sola"
+        else:
+            estado = "interrumpida (la grabación no se cerró bien)"
         self.lbl_cancion.setText(c["nombre"])
         detalle = (f"Sesión {estado} · empezó el {inicio} · {num(c['horas'], 2)} h grabadas · "
                    f"{c['canciones']} canciones medidas")
         if c["pausas"]:
             detalle += f" · {c['pausas']} pausa{'s' if c['pausas'] != 1 else ''} ({mmss(c['segundos_en_pausa'])} sin grabar)"
+        cortes = c.get("cortes") or []
+        if cortes:
+            detalle += (f" · {len(cortes)} corte{'s' if len(cortes) != 1 else ''} "
+                        f"({hms(sum(x['duracion_s'] for x in cortes))} sin grabar)")
         self.lbl_detalle.setText(detalle)
         self.lbl_med.setText("")
         self.bar_mom.poner(float("nan"), "—")
@@ -462,7 +471,7 @@ class PestanaVivo(QWidget):
         if corta:
             nombre += "  (corta: no cuenta)"
         elif p.get("tras_pausa"):
-            nombre += "  (empezó tras una pausa)"
+            nombre += "  (empezó tras una pausa o un corte)"
         valores = [hora, nombre, mmss(p["duracion_s"]), num(p["lufs"]), num(p["lra"]), num(p["tp"]),
                    num(p["salto"], signo=True)]
         for c, v in enumerate(valores):
@@ -1307,6 +1316,12 @@ class Ventana(QMainWindow):
         self.timer_dibujo = QTimer(self)
         self.timer_dibujo.timeout.connect(self.pestana_vivo.redibujar)
         self.timer_dibujo.start(1000)
+        # Una sesión cortada (abierta, sin motor) se vuelve a intentar retomar sola.
+        self.retomando = None        # carpeta de la sesión que se está retomando
+        self.ult_retomar = 0.0
+        self.timer_retomar = QTimer(self)
+        self.timer_retomar.timeout.connect(self._reintentar)
+        self.timer_retomar.start(10_000)
 
         self.pestana_config.cargar_dispositivos()
         info = protocolo.motor_vivo()
@@ -1315,10 +1330,13 @@ class Ventana(QMainWindow):
             self._poner_estado("conectando")
         else:
             self._sin_motor()
+        # El guardián de Windows (tarea programada) retoma la sesión abierta tras un reinicio o una
+        # caída, aunque la ventana no esté abierta.
+        Tarea(guardian.al_dia).iniciar(lambda _r: None, self._guardian_fallo)
 
     # ------------------------------------------------------------------ config
     def guardar_config(self):
-        if self.estado_ui in ("viendo", "terminada"):
+        if self.estado_ui in ("viendo", "terminada", "cortada"):
             # La pestaña muestra una sesión guardada: lo que hay en ella no es la configuración
             # para la próxima grabación y no la reemplaza.
             self.plantilla.monitor = self.chk_escuchar.isChecked()
@@ -1349,6 +1367,14 @@ class Ventana(QMainWindow):
     def grabar_o_detener(self):
         if self.estado_ui in ("viendo", "terminada"):
             self.nueva_sesion()
+            return
+        if self.estado_ui == "cortada":
+            # la sesión se cortó y no se pudo retomar: se puede dar por terminada sin su motor
+            if self._confirmar_detener():
+                carpeta = self.carpeta_sesion
+                sesiones.cerrar_abierta(carpeta, "detenida desde la ventana (estaba cortada)")
+                self.lbl_alertas.hide()
+                self.abrir_sesion(carpeta)
             return
         if self.conn is not None and self.en_curso:
             if not self._confirmar_detener():
@@ -1382,9 +1408,56 @@ class Ventana(QMainWindow):
             return
         self.b_pausa.setEnabled(False)   # se vuelve a habilitar con el próximo estado del motor
 
+    # ------------------------------------------------------------------ retomar
+    def _retomar(self, carpeta):
+        """La sesión abierta no tiene motor (se cortó): se lanza uno que la continúe. Si el guardián
+        lanzó otro al mismo tiempo, el segundo no arranca y la ventana se conecta al primero."""
+        self.carpeta_sesion = carpeta
+        self.retomando = carpeta
+        self.ult_retomar = time.time()
+        self.recibio_fin = False
+        self.proc = sistema.lanzar_desacoplado(sistema.comando_propio("--motor", "--continuar", carpeta))
+        self.esperando = time.time()
+        self._poner_estado("retomando")
+        self.statusBar().showMessage(f"Retomando la sesión · {carpeta}")
+
+    def _retomar_fallo(self, msg):
+        carpeta, self.retomando = self.retomando, None
+        self.esperando = None
+        self.proc = None
+        self.lbl_alertas.setText(f"⚠  La grabación se cortó y no se pudo retomar: {msg}\n"
+                                 "Se vuelve a intentar sola cada minuto (y el guardián de Windows, cada 2). "
+                                 "Si no se puede seguir, «Detener» la termina.")
+        self.lbl_alertas.show()
+        self.abrir_sesion(carpeta)       # se muestra mientras tanto (queda como «cortada»)
+
+    def _reintentar(self):
+        """Cada 10 s, con una sesión cortada a la vista: si el guardián ya lanzó su motor, se conecta;
+        si no, cada minuto vuelve a intentar retomarla."""
+        if self.estado_ui != "cortada" or self.grabando():
+            return
+        if protocolo.motor_vivo():
+            self.esperando = time.time()
+            self._poner_estado("conectando")
+            return
+        ab = protocolo.sesion_abierta()
+        if ab and time.time() - self.ult_retomar >= 60:
+            self._retomar(ab["carpeta"])
+
+    def _guardian_fallo(self, msg):
+        QMessageBox.warning(self, "Guardián de Windows",
+                            "No pude registrar la tarea de Windows que retoma una grabación después de un "
+                            f"reinicio o una caída:\n\n{msg}\n\nLa grabación igual se retoma al abrir Loudness Lab.")
+
     # ------------------------------------------------------------------ sesiones
     def _sin_motor(self):
-        """No hay ninguna grabación en curso: se abre donde se quedó, en la última sesión."""
+        """No hay ninguna grabación en curso: si quedó una sesión abierta (se cortó), se retoma; si
+        no, se abre donde se quedó, en la última sesión."""
+        ab = protocolo.sesion_abierta()
+        if ab:
+            if time.time() - self.ult_retomar >= 20:
+                self._retomar(ab["carpeta"])
+            return
         if sesiones.es_sesion(self.ultima_sesion):
             self.abrir_sesion(self.ultima_sesion, al_inicio=True)
         else:
@@ -1433,7 +1506,7 @@ class Ventana(QMainWindow):
         self.pestana_config.mostrar(snap["config"])
         self._poner_nombre(nombre)
         self.lbl_tiempo.setText(hms(snap["estado"]["segundos"]))
-        self._poner_estado("viendo")
+        self._poner_estado("cortada" if snap["cerrada"].get("abierta") else "viendo")
         self._recordar_sesion(snap["carpeta"])
         self.tabs.setCurrentWidget(self.pestana_vivo)
         self.pestana_vivo.sucio = True
@@ -1449,6 +1522,15 @@ class Ventana(QMainWindow):
         QMessageBox.warning(self, "No pude abrir la sesión", f"{carpeta}\n\n{msg}")
 
     def iniciar(self):
+        ab = protocolo.sesion_abierta()
+        if ab:
+            nombre = os.path.basename(os.path.normpath(ab["carpeta"]))
+            r = QMessageBox.question(self, "Hay una sesión abierta",
+                                     f"La sesión «{nombre}» quedó abierta: se cortó y se retoma sola. Para empezar "
+                                     "otra, primero hay que detenerla (es final).\n\n¿Detenerla y empezar la nueva?")
+            if r != QMessageBox.StandardButton.Yes:
+                return
+            sesiones.cerrar_abierta(ab["carpeta"], "detenida al empezar otra sesión (estaba cortada)")
         self.guardar_config()
         cfg = self.cfg
         if not cfg.dispositivo:
@@ -1523,6 +1605,11 @@ class Ventana(QMainWindow):
             except Exception:
                 pass
         elif self.proc is None:
+            if self.retomando:
+                # el motor que retoma lo lanzó otro (el guardián) o aún no se anuncia: se espera
+                if time.time() - self.esperando > 25:
+                    self._retomar_fallo("el motor no respondió a tiempo.")
+                return
             # El aviso de la grabación a la que había que conectarse ya no está: terminó mientras
             # tanto (por ejemplo, se cerró justo antes de abrir la app). No queda a qué conectarse.
             self.esperando = None
@@ -1532,17 +1619,25 @@ class Ventana(QMainWindow):
                 self._sin_motor()
             return
         if self.proc is not None and self.proc.poll() is not None:
-            self.esperando = None
+            codigo, self.proc = self.proc.returncode, None
             err = ""
             try:
                 err = protocolo.ruta_error().read_text(encoding="utf-8")
             except OSError:
                 pass
+            if self.retomando:
+                if codigo != 0:      # (0: ya había otro motor arrancando, el del guardián: se espera a ese)
+                    self._retomar_fallo(err.split("\n\n")[0] if err else "el motor terminó sin dar detalles.")
+                return
+            self.esperando = None
             self._poner_estado("detenido")
             QMessageBox.critical(self, "No se pudo iniciar la grabación",
                                  (err.split("\n\n")[0] if err else "El motor terminó sin dar detalles.")
                                  + f"\n\nDetalle en {sistema.carpeta_app() / 'motor.log'}")
         elif time.time() - self.esperando > 25:
+            if self.retomando:
+                self._retomar_fallo("el motor no respondió a tiempo.")
+                return
             self.esperando = None
             self._poner_estado("detenido")
             QMessageBox.critical(self, "No se pudo iniciar la grabación", "El motor no respondió a tiempo.")
@@ -1551,6 +1646,7 @@ class Ventana(QMainWindow):
         tipo = m.get("tipo")
         if tipo == "snapshot":
             self.en_curso = True
+            self.retomando = None
             self.carpeta_sesion = m.get("carpeta")
             self.pestana_vivo.reiniciar(m)
             self.pestana_config.mostrar(m.get("config") or {})
@@ -1618,6 +1714,18 @@ class Ventana(QMainWindow):
             self.esperando = time.time()   # sigue grabando: reconectar
             return
         if self.en_curso and not self.recibio_fin:
+            ab = protocolo.sesion_abierta()
+            if ab and self.carpeta_sesion and sesiones._misma_carpeta(ab["carpeta"], self.carpeta_sesion):
+                # El motor murió sin cerrar la sesión: sigue abierta y se retoma. Si se acaba de
+                # retomar y volvió a caer, se espera un minuto antes de insistir.
+                self.en_curso = False
+                self.pestana_vivo.agregar_log("— El motor se detuvo sin cerrar la sesión: se retoma.", "WARNING")
+                if time.time() - self.ult_retomar >= 30:
+                    self._retomar(ab["carpeta"])
+                else:
+                    self.retomando = ab["carpeta"]
+                    self._retomar_fallo("el motor se volvió a detener al poco de retomar.")
+                return
             self._terminar("el motor se cerró inesperadamente; revisa registro.log en la carpeta de la sesión")
         elif not self.en_curso and self.estado_ui == "conectando":
             # Se conectó a una grabación que justo se estaba cerrando y nunca llegó a mostrarla.
@@ -1640,30 +1748,35 @@ class Ventana(QMainWindow):
         self.estado_ui = estado
         textos = {"detenido": ("○ Sin grabar", GRIS), "iniciando": ("◌ Iniciando…", AMARILLO),
                   "conectando": ("◌ Conectando con la grabación en curso…", AMARILLO),
+                  "retomando": ("◌ Retomando la grabación…", AMARILLO),
                   "grabando": ("● Grabando", ROJO), "pausada": ("⏸ En pausa", AMARILLO),
+                  "cortada": ("⚠ Grabación cortada · se retoma sola", ROJO),
                   "terminada": ("■ Terminada", GRIS), "viendo": ("▣ Sesión guardada", GRIS)}
         txt, color = textos[estado]
         self.lbl_estado.setText(txt + (f" ({motivo})" if motivo and estado == "terminada" else ""))
         self.lbl_estado.setStyleSheet(f"color:{color}")
-        activo = estado in ("iniciando", "conectando", "grabando", "pausada")
+        activo = estado in ("iniciando", "conectando", "retomando", "grabando", "pausada")
         solo_lectura = estado in ("viendo", "terminada")
-        self.b_grabar.setText("■  Detener" if activo else ("+  Nueva sesión" if solo_lectura else "▶  Iniciar grabación"))
-        self.b_grabar.setEnabled(estado in ("detenido", "terminada", "viendo", "grabando", "pausada"))
+        # una sesión cortada sigue abierta: se puede detener (es final), no empezar otra encima
+        self.b_grabar.setText("■  Detener" if activo or estado == "cortada"
+                              else ("+  Nueva sesión" if solo_lectura else "▶  Iniciar grabación"))
+        self.b_grabar.setEnabled(estado in ("detenido", "terminada", "viendo", "grabando", "pausada", "cortada"))
         self.b_pausa.setVisible(activo)
         self.b_pausa.setEnabled(estado in ("grabando", "pausada"))
         self.b_pausa.setText("▶  Reanudar" if estado == "pausada" else "⏸  Pausar")
         self.b_sesiones.setEnabled(not activo)
         self._habilitar_excel()
         self.pestana_config.bloquear(
-            activo or solo_lectura,
+            activo or solo_lectura or estado == "cortada",
             "Grabación en curso: la configuración queda fija hasta que termine. Solo se puede cambiar «Escuchar»."
-            if activo else "Sesión guardada: su configuración es de solo lectura. Con «Nueva sesión» puedes "
-                           "grabar otra con estos mismos ajustes.")
+            if activo or estado == "cortada" else "Sesión guardada: su configuración es de solo lectura. Con "
+                                                 "«Nueva sesión» puedes grabar otra con estos mismos ajustes.")
         self.pestana_chequeo.bloquear(activo)
 
     # ------------------------------------------------------------------ resultados
     def _habilitar_excel(self):
-        hay = self.estado_ui in ("grabando", "pausada", "viendo", "terminada") and self.pestana_vivo.inicio_epoch is not None
+        hay = self.estado_ui in ("grabando", "pausada", "viendo", "terminada", "cortada") \
+            and self.pestana_vivo.inicio_epoch is not None
         self.b_excel.setEnabled(hay and not self.exportando)
 
     def descargar_resultados(self):
@@ -1744,7 +1857,8 @@ class Ventana(QMainWindow):
             caja = QMessageBox(self)
             caja.setWindowTitle("Hay una grabación en curso")
             caja.setText("La grabación corre aparte de esta ventana: puede seguir aunque la cierres, y al "
-                         "volver a abrir Loudness Lab te reconectas a ella.")
+                         "volver a abrir Loudness Lab te reconectas a ella. Si el PC se reinicia o el programa "
+                         "se cierra, la grabación se retoma sola al volver a iniciar sesión.")
             seguir = caja.addButton("Cerrar la ventana y seguir grabando", QMessageBox.ButtonRole.AcceptRole)
             detener = caja.addButton("Detener la sesión (es final) y cerrar", QMessageBox.ButtonRole.DestructiveRole)
             caja.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)

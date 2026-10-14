@@ -11,6 +11,11 @@ Sesión en disco (compatible con analizar.py):
   mediciones.f32          por bloque de 100 ms: energía K de cada canal, pico de muestra, true peak
   sesion.json             dispositivo, formato, condiciones del experimento y resumen en vivo
   registro.log            lo mismo que muestra el registro de la ventana
+  latido.json             cada 5 s: hasta dónde llegó la grabación y a qué hora (para medir un corte)
+
+Una sesión queda abierta hasta que se detiene (o se cumple su duración). Si el motor muere antes
+(un reinicio, un corte de luz, una caída), la sesión no termina: el próximo motor la retoma con
+--continuar, repara lo que quedó a medias y registra el tramo sin grabar como un «corte».
 """
 
 import argparse
@@ -32,9 +37,9 @@ from pathlib import Path
 
 import numpy as np
 
-from . import VERSION, dispositivos, protocolo, sistema
+from . import VERSION, dispositivos, protocolo, recuperar, sesiones, sistema
 from .bs1770 import MedidorBloques
-from .metadata import HiloMetadata, HiloSimulado
+from .metadata import CAMPOS, HiloMetadata, HiloSimulado
 from .picos import SEG_ANTES, SEG_DESPUES, GuardaPicos
 from .seguimiento import Seguidor, Serie
 
@@ -42,12 +47,29 @@ SEG_POR_ARCHIVO = 3600
 DISCO_MINIMO_GB = 2.0   # bajo esto se detiene, para no dejar archivos a medias con el disco lleno
 DISCO_AVISO_GB = 20.0
 SIN_DATOS_S = 5.0       # el silencio de fondo garantiza un flujo continuo: si no llega nada, se cayó
+LATIDO_S = 5.0          # cada cuánto se anota en latido.json hasta dónde llegó la grabación
 
 log = logging.getLogger("loudness")
 
 
 def ahora_iso():
     return dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def iso_de(epoch):
+    return dt.datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="milliseconds")
+
+
+def epoch_de(iso):
+    try:
+        return dt.datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def hms_txt(seg):
+    seg = int(max(0, seg))
+    return f"{seg // 3600}:{seg % 3600 // 60:02d}:{seg % 60:02d}"
 
 
 # ----------------------------------------------------------------------------
@@ -91,6 +113,14 @@ class Escritor:
             with self.lock:
                 self.frame_en_archivo += len(parte)
                 self.frame_global += len(parte)
+
+    def continuar(self, archivos, frame_global):
+        """Sigue una sesión cortada: el audio nuevo va a un WAV nuevo, a continuación de los que hay."""
+        self.archivos = [{k: a[k] for k in ("archivo", "frame_global_inicio", "hora_pc_inicio")} for a in archivos]
+        self.frame_global = frame_global
+        self.n_archivo = max((int(a["archivo"][6:10]) for a in archivos), default=0)
+        self.nombre_archivo = archivos[-1]["archivo"] if archivos else ""
+        self.frame_en_archivo = archivos[-1]["frames"] if archivos else 0
 
     def posicion(self):
         with self.lock:
@@ -348,17 +378,38 @@ class HandlerVentana(logging.Handler):
 # Motor
 # ----------------------------------------------------------------------------
 class Motor:
-    def __init__(self, cfg):
+    def __init__(self, cfg, continuar=None, estado="grabando"):
+        """`continuar`: la carpeta de una sesión abierta que se cortó; `cfg` trae entonces solo lo que
+        no es del experimento (la escucha), y `estado` es el que tenía: «grabando» o «pausada»."""
+        self.previa = None
+        self.estado_deseado = estado
+        if continuar:
+            self.carpeta = os.path.normpath(continuar)
+            previa = sesiones._json(os.path.join(self.carpeta, "sesion.json"))
+            if previa is None:
+                raise RuntimeError(f"No encuentro la sesión «{self.carpeta}»: falta sesion.json.")
+            if previa.get("fin_pc"):
+                raise RuntimeError(f"La sesión «{self.carpeta}» ya terminó: no se puede continuar.")
+            self.previa = previa
+            cfg = {**sesiones._config_de(previa, self.carpeta), **(cfg or {})}
+            self.etiqueta = previa.get("etiqueta") or os.path.basename(self.carpeta)
+        else:
+            # El nombre de la sesión es el de su carpeta. Sin nombre, se usa la fecha para no chocar.
+            self.etiqueta = sistema.limpiar_nombre(cfg.get("etiqueta") or f"sesion_{dt.datetime.now():%Y%m%d_%H%M%S}")
+            base = Path(cfg.get("carpeta_salida") or sistema.carpeta_salida_por_defecto())
+            self.carpeta = str(base / self.etiqueta)
+            try:
+                os.makedirs(self.carpeta, exist_ok=False)
+            except FileExistsError:
+                raise FileExistsError(f"Ya existe una sesión llamada «{self.etiqueta}» en {base}. Una sesión "
+                                      "detenida no se puede continuar: elige otro nombre.") from None
         self.cfg = cfg
-        # El nombre de la sesión es el de su carpeta. Sin nombre, se usa la fecha para no chocar.
-        self.etiqueta = sistema.limpiar_nombre(cfg.get("etiqueta") or f"sesion_{dt.datetime.now():%Y%m%d_%H%M%S}")
-        base = Path(cfg.get("carpeta_salida") or sistema.carpeta_salida_por_defecto())
-        self.carpeta = str(base / self.etiqueta)
-        try:
-            os.makedirs(self.carpeta, exist_ok=False)
-        except FileExistsError:
-            raise FileExistsError(f"Ya existe una sesión llamada «{self.etiqueta}» en {base}. Una sesión "
-                                  "detenida no se puede continuar: elige otro nombre.") from None
+        self.abierta = False       # este motor ya anotó la sesión como abierta (sesion_abierta.json)
+        self.cortes = []           # tramos sin grabar porque el motor se cortó (ver _preparar_continuacion)
+        self.corte_pendiente = None
+        self.reparaciones = []
+        self._descartar = 0        # filas del medidor calentado que ya estaban medidas
+        self.ult_latido = 0.0
         self.cola_audio = queue.Queue()
         self.cola_eventos = queue.Queue()
         self.publicador = Publicador()
@@ -392,10 +443,46 @@ class Motor:
     def _segundos_pausados(self):
         return self.pausa_total + self._en_pausa_s()
 
+    def _segundos_cortes(self):
+        return sum(c["duracion_s"] for c in self.cortes)
+
     def _pausas_gui(self):
-        """[segundo de audio donde empezó, cuánto duró] de cada pausa (la actual, lo que lleva)."""
-        return [[p["t_s"], p["duracion_s"] if p["duracion_s"] is not None else self._en_pausa_s()]
-                for p in self.pausas]
+        """[segundo de audio donde empezó, cuánto duró] de cada tramo sin grabar: las pausas (la actual,
+        lo que lleva) y los cortes. Para el gráfico, ambos son un hueco."""
+        huecos = [[p["t_s"], p["duracion_s"] if p["duracion_s"] is not None else self._en_pausa_s()]
+                  for p in self.pausas]
+        huecos += [[c["t_s"], c["duracion_s"]] for c in self.cortes]
+        return sorted(huecos, key=lambda h: h[0])
+
+    def _reloj_de(self, frame):
+        """La hora (epoch) en que se grabó un frame: el audio no incluye pausas ni cortes."""
+        t = frame / self.sr
+        return self.t0 + t + sum(d for ts, d in self._pausas_gui() if ts < t)
+
+    def _extra(self):
+        """Lo que el próximo motor necesita además de la configuración del experimento."""
+        extra = {"monitor": self.monitor.stream is not None, "monitor_vol": self.monitor.vol,
+                 "monitor_dispositivo": self.cfg.get("monitor_dispositivo", "")}
+        extra.update({k: v for k, v in self.cfg.items() if k.startswith("_")})   # (solo pruebas)
+        return extra
+
+    def _escribir_abierta(self):
+        protocolo.escribir_abierta(self.carpeta, "pausada" if self.pausado else "grabando", self._extra())
+        self.abierta = True
+
+    def _latido(self, error=""):
+        """Hasta dónde llegó la grabación y a qué hora. Si el motor muere, el próximo sabe desde cuándo
+        no se grabó."""
+        d = {"epoch": time.time(), "hora": ahora_iso(), "frame": self.escritor.frame_global,
+             "desfase": self.desfase, "pausado": self.pausado, "pid": os.getpid(), "error": error}
+        ruta = os.path.join(self.carpeta, "latido.json")
+        try:
+            with open(ruta + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(d, f)
+            os.replace(ruta + ".tmp", ruta)
+        except OSError:
+            pass
+        self.ult_latido = time.time()
 
     # ------------------------------------------------------------------ arranque
     def ejecutar(self):
@@ -410,16 +497,27 @@ class Motor:
         self.ch = int(self.lb["maxInputChannels"])
         self.blk = self.sr // 10
         self.gb_hora = self.sr * self.ch * 4 * 3600 / 1e9
+        if self.previa is not None:
+            sr0, ch0 = int(self.previa.get("sample_rate") or 0), int(self.previa.get("canales") or 0)
+            if (sr0, ch0) != (self.sr, self.ch):
+                raise RuntimeError(f"«{nombre}» entrega ahora {self.sr} Hz y {self.ch} canales, y la sesión se "
+                                   f"grabó con {sr0} Hz y {ch0}: así no se puede continuar la misma sesión.")
 
         self.escritor = Escritor(self.carpeta, self.sr, self.ch)
         self.medidor = MedidorBloques(self.sr, self.ch)
         self.seguidor = Seguidor(min_dur=float(cfg.get("min_dur", 30)), refinar_s=3.0,
                                  umbral_salto=float(cfg.get("umbral_salto", 3.0)))
-        self.picos = GuardaPicos(self.carpeta, self.sr, float(cfg.get("min_dur", 30)))
+        if self.previa is not None:
+            self._preparar_continuacion()
+        else:
+            self.picos = GuardaPicos(self.carpeta, self.sr, float(cfg.get("min_dur", 30)))
         self.f_bloques = open(os.path.join(self.carpeta, "mediciones.f32"), "ab")
-        self.f_reloj = open(os.path.join(self.carpeta, "reloj.csv"), "a", newline="", encoding="utf-8")
+        ruta_reloj = os.path.join(self.carpeta, "reloj.csv")
+        reloj_nuevo = not os.path.exists(ruta_reloj)
+        self.f_reloj = open(ruta_reloj, "a", newline="", encoding="utf-8")
         self.w_reloj = csv.writer(self.f_reloj)
-        self.w_reloj.writerow(["hora_pc", "epoch_s", "frame_global", "segundos_audio", "desfase_s"])
+        if reloj_nuevo:
+            self.w_reloj.writerow(["hora_pc", "epoch_s", "frame_global", "segundos_audio", "desfase_s"])
 
         self.sesion = {
             "app": f"Loudness Lab {VERSION}",
@@ -438,6 +536,9 @@ class Motor:
                            "columnas": [f"z_canal{i}" for i in range(self.ch)] + ["sample_peak", "true_peak"],
                            "nota": "z = energía K-ponderada (media cuadrática) del canal; picos lineales"},
         }
+        if self.previa is not None:   # lo que ya decía la sesión se conserva (inicio, condiciones, chequeo…)
+            self.sesion = {**self.sesion, **{k: v for k, v in self.previa.items() if k in self.sesion},
+                           "app": self.sesion["app"], "t0_epoch": self.t0}
 
         clave = secrets.token_hex(16)
         self.listener = Listener(("127.0.0.1", 0), authkey=bytes.fromhex(clave))
@@ -449,6 +550,8 @@ class Motor:
         self.monitor = Monitor(self)
         if cfg.get("monitor"):
             self.monitor.abrir(cfg.get("monitor_dispositivo", ""), cfg.get("monitor_vol", 0.5))
+        if self.previa is not None:
+            self._escribir_corte()
 
         pistas = os.path.join(self.carpeta, "pistas.csv")
         if cfg.get("_simular_avisos"):
@@ -456,6 +559,9 @@ class Motor:
         else:
             self.meta = HiloMetadata(pistas, self.escritor.posicion, cfg.get("app", ""), self.cola_eventos.put)
         self.meta.start()
+        if self.previa is not None and self.estado_deseado == "pausada":
+            self._pausar()      # se cortó estando en pausa: sigue en pausa
+        self._escribir_abierta()   # desde aquí, si el motor muere, el próximo retoma esta sesión
 
         if not sistema.impedir_suspension(True):
             log.warning("No pude impedir que el PC se suspenda: revisa la configuración de energía.")
@@ -465,8 +571,130 @@ class Motor:
                  self.libre_gb, self.libre_gb / self.gb_hora, cfg.get("app") or "cualquiera")
         try:
             self._bucle()
-        finally:
-            self._cerrar()
+        except BaseException as e:
+            # Un error no termina la sesión: se cierra lo que se pueda y queda abierta para retomarla.
+            try:
+                self._cerrar(final=False, error=f"{type(e).__name__}: {e}")
+            except Exception:
+                log.exception("Al cerrar tras el error")
+            raise
+        self._cerrar(final=True)
+
+    # ------------------------------------------------------------------ continuar
+    def _preparar_continuacion(self):
+        """Retoma una sesión cortada. Repara sus archivos, deja el seguimiento (canciones, saltos,
+        estadísticas) como estaba con lo que hay en disco y calcula desde cuándo no se grabó. El tramo
+        sin grabar se anota como «corte» en _escribir_corte, cuando el audio ya está de vuelta."""
+        prev = self.previa
+        archivos, total, bloques, self.reparaciones = recuperar.preparar(self.carpeta, self.sr, self.ch,
+                                                                         prev.get("archivos"))
+        self.escritor.continuar(archivos, total)
+        self.picos = GuardaPicos(self.carpeta, self.sr, float(self.cfg.get("min_dur", 30)))
+        seg, eventos, n = sesiones.repasar(self.carpeta, prev, self.cfg)
+        self.seguidor = seg
+        self.t0 = float(prev.get("t0_epoch") or (epoch_de(archivos[0]["hora_pc_inicio"]) if archivos else None)
+                        or epoch_de(prev.get("inicio_pc")) or time.time())
+        self.overflows = self.overflows_aviso = int(prev.get("overflows") or 0)
+        self.reaperturas = int(prev.get("reaperturas") or 0)
+
+        # pausas y cortes anteriores, tal como quedaron en pistas.csv (se escribe al instante)
+        abierta = None
+        for e in eventos:
+            ev, fg = e["evento"], int(e["frame_global"])
+            if ev == "pausa":
+                abierta = {"frame": fg, "t_s": fg / self.sr, "hora_pausa": e["hora_pc"], "hora_reanuda": None,
+                           "duracion_s": None}
+            elif ev == "reanuda" and abierta is not None:
+                ini, fin = epoch_de(abierta["hora_pausa"]), epoch_de(e["hora_pc"])
+                abierta.update(hora_reanuda=e["hora_pc"], duracion_s=(fin - ini) if ini and fin else 0.0)
+                self.pausas.append(abierta)
+                abierta = None
+        for c in sesiones.cortes_de(eventos, self.sr):
+            self.cortes.append({"frame": int(round(c["t_s"] * self.sr)), **c})
+
+        # hasta cuándo se grabó: el último latido, o mejor, el audio que alcanzó a quedar en disco
+        lat = sesiones._json(os.path.join(self.carpeta, "latido.json")) or {}
+        ultimo = lat.get("epoch")
+        if not ultimo:
+            fechas = [os.path.getmtime(os.path.join(self.carpeta, x)) for x in ("mediciones.f32", "registro.log")
+                      if os.path.exists(os.path.join(self.carpeta, x))]
+            ultimo = max(fechas) if fechas else time.time()
+        pausado_total = sum(p["duracion_s"] for p in self.pausas) + self._segundos_cortes()
+        if abierta is not None:
+            # se cortó estando en pausa: la pausa dura hasta el corte
+            muerte = max(ultimo, epoch_de(abierta["hora_pausa"]) or ultimo)
+            abierta.update(hora_reanuda=iso_de(muerte), duracion_s=muerte - (epoch_de(abierta["hora_pausa"]) or muerte))
+            self.pausas.append(abierta)
+        else:
+            estimada = self.t0 + pausado_total + total / self.sr + float(lat.get("desfase") or 0.0)
+            muerte = min(max(estimada, ultimo), time.time())
+        self.pausa_total = sum(p["duracion_s"] for p in self.pausas) + self._segundos_cortes()
+        motivo = f"el programa falló ({lat['error']})" if lat.get("error") else sistema.motivo_corte(muerte)
+        self.corte_pendiente = {"muerte": muerte, "motivo": motivo, "cerrar_pausa": abierta is not None}
+
+        idx = np.arange(9, n, 10)   # el gráfico: un punto por segundo, como en vivo
+        self.curva_t.agregar((idx + 1) / 10.0)
+        self.curva_st.agregar(seg.st.v[idx])
+        for item in sesiones._log(self.carpeta):
+            self.log_reciente.append(item)
+        self._recuperar_picos(seg.saltos_notorios, archivos)
+        seg.saltos_notorios, seg.nuevas = [], []
+        self.stats = seg.estadisticas()
+        self.desfase = float(lat.get("desfase") or 0.0)
+        # el medidor sigue con el estado que tenía, como si el audio fuera de corrido
+        self.medidor, self._descartar = recuperar.medidor_calentado(self.carpeta, archivos, self.sr, self.ch, bloques)
+
+    def _recuperar_picos(self, saltos, archivos):
+        """Los recortes de saltos que se detectaron pero no alcanzaron a guardarse antes del corte se
+        sacan ahora del audio en disco."""
+        hechos = self.picos.guardados()
+        for e in saltos:
+            corte = e["corte"] * self.blk
+            if round(corte / self.sr, 3) in hechos:
+                continue
+            f0 = max(0, corte - SEG_ANTES * self.sr)
+            audio = recuperar.leer_audio(self.carpeta, archivos, f0, corte + SEG_DESPUES * self.sr)
+            if len(audio):
+                self.picos.alimentar(f0, audio)
+                try:
+                    fila = self.picos.guardar(e, self._reloj_de)
+                    if fila:
+                        log.info("Recorte del salto de %+.1f LU recuperado: picos\\%s", e["salto"], fila["archivo"])
+                except Exception as ex:
+                    log.warning("No pude recuperar el recorte del salto de %+.1f LU: %s", e["salto"], ex)
+        self.picos.retrovisor.trozos.clear()
+
+    def _escribir_corte(self):
+        """Anota en pistas.csv el tramo sin grabar (corte → retoma, en el mismo frame) y se lo pasa
+        al seguimiento: igual que una pausa, cierra la canción que sonaba y no hay salto a través de él."""
+        c = self.corte_pendiente
+        ahora = time.time()
+        fg, arch, fa = self.escritor.posicion()
+        filas = []
+        if c["cerrar_pausa"]:
+            filas.append({"evento": "reanuda", "hora_pc": iso_de(c["muerte"])})
+        filas.append({"evento": "corte", "hora_pc": iso_de(c["muerte"]), "estado": c["motivo"]})
+        filas.append({"evento": "retoma", "hora_pc": iso_de(ahora)})
+        ruta = os.path.join(self.carpeta, "pistas.csv")
+        nuevo = not os.path.exists(ruta)
+        with open(ruta, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CAMPOS)
+            if nuevo:
+                w.writeheader()
+            for fila in filas:
+                fila.update(frame_global=fg, archivo=arch, frame_en_archivo=fa)
+                w.writerow(fila)
+                self.seguidor.evento(fila, fg // self.blk)
+        dur = ahora - c["muerte"]
+        self.cortes.append({"frame": fg, "t_s": fg / self.sr, "desde": iso_de(c["muerte"]), "hasta": iso_de(ahora),
+                            "duracion_s": dur, "motivo": c["motivo"]})
+        self.pausa_total += dur
+        for r in self.reparaciones:
+            log.info("Al retomar: %s.", r)
+        log.warning("La grabación se cortó a las %s (%s) y se retomó a las %s: %s sin grabar. "
+                    "Lo grabado antes del corte está completo.", dt.datetime.fromtimestamp(c["muerte"]).strftime("%H:%M:%S"),
+                    c["motivo"], dt.datetime.fromtimestamp(ahora).strftime("%H:%M:%S"), hms_txt(dur))
+        self.corte_pendiente = None
 
     def _abrir_audio(self):
         pa = self.pa
@@ -536,7 +764,10 @@ class Motor:
     # ------------------------------------------------------------------ bucle
     def _bucle(self):
         cfg = self.cfg
-        self.t0 = time.time()
+        if self.previa is None:
+            self.t0 = time.time()
+            self.sesion["t0_epoch"] = self.t0
+        self._latido()
         horas = float(cfg.get("horas") or 0)
         self.ult_dato = time.time()
         ult_estado = ult_seg = 0.0
@@ -565,7 +796,7 @@ class Motor:
             if ahora - ult_min >= 60:
                 self._cada_minuto()
                 ult_min = ahora
-            if horas > 0 and ahora - self.t0 - self._segundos_pausados() >= horas * 3600:
+            if horas > 0 and self.escritor.frame_global / self.sr >= horas * 3600:   # horas de audio grabado
                 self.motivo_fin = "se cumplió la duración configurada"
                 break
 
@@ -595,6 +826,10 @@ class Motor:
         self._medir(*self.medidor.procesar(bloque))
 
     def _medir(self, zc, sp, tp):
+        if self._descartar and len(sp):   # el medidor calentado entrega primero bloques ya medidos
+            k = min(self._descartar, len(sp))
+            zc, sp, tp = zc[k:], sp[k:], tp[k:]
+            self._descartar -= k
         if not len(sp):
             return
         self.f_bloques.write(np.column_stack([zc, sp, tp]).astype(np.float32).tobytes())
@@ -647,7 +882,7 @@ class Motor:
         """Un fallo al guardar un recorte no debe afectar a la grabación: solo se avisa."""
         for e in self.seguidor.saltos_notorios:
             try:
-                fila = self.picos.guardar(e, self.t0)
+                fila = self.picos.guardar(e, self._reloj_de)
             except Exception as ex:
                 log.warning("No pude guardar el recorte del salto de %+.1f LU: %s", e["salto"], ex)
                 continue
@@ -687,6 +922,7 @@ class Motor:
                         self.monitor.abrir(self.cfg["monitor_dispositivo"], float(c.get("vol", 0.5)))
                 else:
                     self.monitor.cerrar()
+                self._escribir_abierta()
 
     def _pausar(self):
         if self.pausado:
@@ -697,6 +933,9 @@ class Motor:
                             "hora_reanuda": None, "duracion_s": None})
         self.meta.marcar("pausa", pos)
         self.publicador.enviar({"tipo": "pausas", "pausas": self._pausas_gui()})
+        if self.abierta:
+            self._escribir_abierta()
+            self._latido()
         log.info("Grabación en pausa: el audio no se registra hasta que reanudes.")
 
     def _reanudar(self):
@@ -709,6 +948,8 @@ class Motor:
         self.sin_meta_desde = None   # la metadata vuelve a leerse desde cero
         self.meta.marcar("reanuda", self.escritor.posicion())
         self.publicador.enviar({"tipo": "pausas", "pausas": self._pausas_gui()})
+        self._escribir_abierta()
+        self._latido()
         log.info("Grabación reanudada tras %s de pausa.", f"{int(dur // 60)}:{int(dur % 60):02d}")
 
     # ------------------------------------------------------------------ periódicas
@@ -722,6 +963,14 @@ class Motor:
             log.info("Se resolvió: %s", codigo)
 
     def _cada_segundo(self):
+        # a disco cada segundo: si el motor muere, se pierde a lo más eso (y se vuelve a medir del audio)
+        self.f_bloques.flush()
+        self.f_reloj.flush()
+        if time.time() - self.ult_latido >= LATIDO_S:
+            self._latido()
+        falla = self.cfg.get("_fallar_tras_s")   # (solo pruebas) un error a mitad de la grabación
+        if falla and self.escritor.frame_global / self.sr >= float(falla):
+            raise RuntimeError("falla simulada")
         if self.curva_pend:
             self.publicador.enviar({"tipo": "curva", "puntos": self.curva_pend})
             self.curva_pend = []
@@ -799,7 +1048,8 @@ class Motor:
         s = dict(self.sesion, archivos=self.escritor.archivos, frames_totales=self.escritor.frame_global,
                  segundos_totales=self.escritor.frame_global / self.sr, overflows=self.overflows,
                  reaperturas=self.reaperturas, resumen_en_vivo=self.stats, pausas=self.pausas,
-                 segundos_en_pausa=self._segundos_pausados())
+                 segundos_en_pausa=self._segundos_pausados() - self._segundos_cortes(),
+                 cortes=self.cortes, segundos_en_cortes=self._segundos_cortes())
         if fin:
             s["fin_pc"] = ahora_iso()
             s["motivo_fin"] = self.motivo_fin
@@ -810,22 +1060,25 @@ class Motor:
         os.replace(tmp, ruta)
 
     # ------------------------------------------------------------------ cierre
-    def _cerrar(self):
+    def _cerrar(self, final=True, error=""):
+        """final: la sesión termina (Detener, duración cumplida, disco lleno). Si no (un error), se
+        cierra todo limpio pero la sesión queda abierta, y el próximo motor la retoma."""
         self._cerrar_audio()
         while True:  # lo que quedó en cola también se guarda
             datos = self._sacar_audio(0)
             if not datos:
                 break
             self._procesar_audio(datos)
-        if self.pausado:   # se detuvo estando en pausa: la pausa queda con la duración que llevaba
+        if final and self.pausado:   # se detuvo estando en pausa: la pausa queda con la duración que llevaba
             self.pausas[-1]["duracion_s"] = self._en_pausa_s()
             self.pausa_total += self._en_pausa_s()
             self.pausado = False
         self._medir(*self.medidor.terminar())
         self._procesar_eventos()
-        self.seguidor.terminar()
-        self._publicar_pistas()
-        self._guardar_picos()
+        if final:
+            self.seguidor.terminar()
+            self._publicar_pistas()
+            self._guardar_picos()
         self.meta.detener.set()
         self.meta.join(timeout=3)
         self.monitor.cerrar()
@@ -833,10 +1086,21 @@ class Motor:
         self.f_reloj.close()
         self.f_bloques.close()
         self.stats = self.seguidor.estadisticas()
-        self.motivo_fin = self.motivo_fin or "fin"
-        self._guardar_sesion(fin=True)
         sistema.impedir_suspension(False)
         self.terminado = True
+        if not final:
+            self._guardar_sesion()
+            self._latido(error=error)
+            log.error("El motor se detuvo por un error (%s). La sesión sigue abierta: se retomará sola.", error)
+            self.publicador.cerrar()     # sin «fin»: la ventana lo toma como un corte y la retoma
+            try:
+                self.listener.close()
+            except Exception:
+                pass
+            return
+        self.motivo_fin = self.motivo_fin or "fin"
+        self._guardar_sesion(fin=True)
+        protocolo.borrar_abierta(self.carpeta)
         st = self.stats
         log.info("Grabación terminada (%s): %.2f h, %d canciones medidas, %d cambios, %d sobre %.0f LU.",
                  self.motivo_fin, self.escritor.frame_global / self.sr / 3600, st["canciones"],
@@ -874,19 +1138,31 @@ def _configurar_log(motor=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="LoudnessLab --motor")
     ap.add_argument("--motor", action="store_true")
-    ap.add_argument("--config", required=True)
+    ap.add_argument("--config", help="una sesión nueva, con esta configuración")
+    ap.add_argument("--continuar", help="retomar esta sesión abierta, que se cortó")
     args = ap.parse_args(argv)
     _configurar_log()
+    if not sistema.candado_motor():
+        # Ya hay un motor (quizá lo lanzaron la ventana y el guardián a la vez): no hay nada que hacer.
+        log.info("Ya hay un motor corriendo; este no arranca.")
+        return 0 if args.continuar else 1
     try:
         protocolo.ruta_error().unlink()
     except OSError:
         pass
     motor = None
     try:
-        cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
-        if protocolo.motor_vivo():
-            raise RuntimeError("Ya hay una grabación en curso.")
-        motor = Motor(cfg)
+        if args.continuar:
+            ab = protocolo.leer_abierta()
+            if not ab or not sesiones._misma_carpeta(ab["carpeta"], args.continuar):
+                # Solo se retoma la sesión que quedó anotada como abierta: nunca una sesión vieja.
+                raise RuntimeError(f"«{args.continuar}» no es la sesión abierta: no se retoma.")
+            motor = Motor(dict(ab.get("extra") or {}), continuar=args.continuar, estado=ab.get("estado", "grabando"))
+        else:
+            cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            if protocolo.motor_vivo():
+                raise RuntimeError("Ya hay una grabación en curso.")
+            motor = Motor(cfg)
         _configurar_log(motor)
         motor.ejecutar()
         return 0
@@ -896,7 +1172,9 @@ def main(argv=None):
             protocolo.ruta_error().write_text(f"{e}\n\n{traceback.format_exc()}", encoding="utf-8")
         except OSError:
             pass
-        if motor is not None:
+        if motor is not None and not args.continuar and not motor.abierta:
+            # una sesión nueva que no alcanzó a empezar: la ventana muestra el error. Si la sesión ya
+            # estaba abierta, no se avisa «fin»: sigue abierta y se retoma.
             motor.publicador.enviar({"tipo": "fin", "motivo": f"error: {e}"})
             time.sleep(0.5)
         return 1

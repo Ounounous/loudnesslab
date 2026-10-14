@@ -16,7 +16,7 @@ Acceso directo **Loudness Lab** en el escritorio (es `dist\LoudnessLab\LoudnessL
 2. **Configuración**: carpeta de salida (por defecto `Q:\LoudnessLab\grabaciones`), nombre de la sesión y condiciones del experimento (fuente, playlist, normalización, crossfade, calidad). Todo queda en `sesion.json`.
 3. **Iniciar grabación**. La pestaña **En vivo** muestra la canción actual, momentary y short-term, el gráfico con el nivel de cada canción y los cortes, la tabla de canciones con los saltos sobre el umbral marcados, los promedios de la sesión y el registro.
 
-La grabación corre en un proceso aparte: **cerrar la ventana no la detiene**, y al volver a abrir la app se reconecta. Mientras graba, el PC no se suspende. Si la app de música deja de sonar, deja de llegar audio al cable o se acaba el disco, aparece un aviso en rojo.
+La grabación corre en un proceso aparte: **cerrar la ventana no la detiene**, y al volver a abrir la app se reconecta. Si el PC se reinicia o se apaga, o el programa se cae, **la grabación se retoma sola** (ver «Si la grabación se corta»). Mientras graba, el PC no se suspende solo. Si la app de música deja de sonar, deja de llegar audio al cable o se acaba el disco, aparece un aviso en rojo.
 
 Los números en vivo usan exactamente la misma medición que `analizar.py`; el análisis final sigue siendo el de la sección 5.
 
@@ -25,7 +25,17 @@ Los números en vivo usan exactamente la misma medición que `analizar.py`; el a
 - **Pausar / Reanudar** (botón junto a «Detener») es para una pausa momentánea. Mientras dura, el audio **no se graba ni se mide**: lo que suene en ese rato no entra al experimento, y el reloj de la grabación no avanza. La sesión sigue en la misma carpeta. En el gráfico queda un hueco, y la canción que suena al reanudar se marca «empezó tras una pausa»: llega empezada, no se compara con la de antes de la pausa (no genera salto) y no se junta con ella. Si cierras la ventana en pausa, al volver a abrir la app se reconecta y sigue en pausa.
 - **Detener es final.** Antes de detener, la app avisa. Una sesión detenida se guarda completa y se puede abrir, pero **no se puede continuar**: para otra grabación se crea una sesión nueva.
 - **Sesiones…** (arriba) lista las sesiones de la carpeta de salida, con «Otra carpeta…» para abrir una que esté en otro lugar. Abrir una sesión muestra su gráfico, canciones, promedios, registro y la configuración con que se grabó (solo lectura), reconstruidos desde `mediciones.f32` y `pistas.csv` con la misma medición de la grabación, sin necesitar el audio. **«Nueva sesión»** parte con esos mismos ajustes y un nombre libre.
-- **Al abrir la app** vuelve a la última sesión que tuviste abierta (o se conecta a la grabación en curso, si la hay).
+- **Al abrir la app** vuelve a la última sesión que tuviste abierta (o se conecta a la grabación en curso, si la hay, o retoma la que quedó cortada).
+
+### Si la grabación se corta (reinicio, apagado, corte de luz, caída)
+Una sesión queda **abierta hasta que tocas Detener** (o hasta que se cumple su duración). Si el motor de grabación muere antes, la sesión no termina: queda **cortada** y se **retoma sola**, en el mismo estado en que estaba (grabando o en pausa).
+- **Quién la retoma**: la ventana, si está abierta (al instante) o cuando la abras; y si no, el **guardián**, una tarea del Programador de tareas de Windows (`\LoudnessLab\Guardian`) que la app registra sola la primera vez que se abre. Corre al iniciar sesión en Windows y cada 2 minutos; si no hay una sesión abierta, no hace nada. No es un servicio: el nombre de la canción y los reproductores solo existen con tu usuario adentro, así que **después de reiniciar, la grabación sigue cuando inicias sesión** (sin inicio de sesión automático). La app de música hay que volver a ponerla a sonar a mano.
+- **Qué queda registrado**: el tramo sin grabar es un **corte**, con su hora de inicio y fin y el motivo, que se saca del registro de eventos de Windows («reinicio de Windows desde el menú Inicio (usuario …)», «apagado inesperado (corte de luz, batería agotada o el PC se colgó)», «el programa se cerró…», «el programa falló (…)»). Va en el registro, en `pistas.csv` (filas `corte` y `retoma`) y en `sesion.json` (`cortes`).
+- **Se trata igual que una pausa**: en el gráfico queda un hueco, la canción que sonaba se cierra en el corte, la que suena al retomar se marca «empezó tras una pausa o un corte» y no hay salto a través del corte. `analizar.py` lo entiende igual (en su resumen: `cortes` y `segundos_en_cortes`).
+- **No se pierde lo grabado**: el audio llega a disco al instante y las mediciones cada segundo. Al retomar se repara lo que quedó a medias: la cabecera del WAV que se estaba escribiendo, las mediciones que faltaron (se vuelven a medir desde el audio, partiendo un poco antes para que el filtro llegue igual) y la última línea a medias de los CSV. Lo único que se descarta es el resto de menos de 100 ms que no completa un bloque. Probado matando el motor de golpe, en pausa y por error: la medición en vivo, con los cortes, coincide con `analizar.py` bloque por bloque (diferencia 0,0000 dB) y las canciones y saltos son los mismos.
+- **Si no se puede retomar** (por ejemplo, el cable desapareció o cambió de formato) la ventana lo dice en rojo, muestra la sesión como «Grabación cortada · se retoma sola» y lo vuelve a intentar cada minuto (el guardián, cada 2). **Detener** la da por terminada (repara sus archivos igual). Para empezar otra sesión, primero hay que detener la que quedó abierta: la app lo pregunta.
+- **Sin internet** la grabación no se detiene: graba lo que llegue (silencio si el reproductor se quedó sin música) y sigue igual cuando vuelve. La medición no cambia.
+- Solo se retoma la sesión que quedó anotada como abierta por esta versión (`%APPDATA%\LoudnessLab\sesion_abierta.json`); las sesiones viejas interrumpidas no se tocan.
 
 ### Gráfico de LUFS: zoom
 - **Rueda del mouse**: acerca o aleja el tiempo, alrededor del puntero. **Ctrl + rueda**: acerca o aleja la escala de LUFS (útil para ver las diferencias de un par de LU entre canciones, que en la escala completa de −45 a 0 se aprietan).
@@ -34,7 +44,7 @@ Los números en vivo usan exactamente la misma medición que `analizar.py`; el a
 
 ### Descargar resultados (Excel)
 El botón **Descargar resultados** (arriba a la derecha) guarda un `.xlsx` de la sesión que se está viendo o grabando, con cuatro hojas:
-1. **Últimas canciones**: todas las canciones de la sesión (no solo las últimas que caben en la tabla), de la primera a la última, con las mismas columnas de la tabla más una «Nota» (corta / empezó tras una pausa). Los números son números, con filtros, y los saltos y true peak sobre el umbral van marcados como en la ventana. Un true peak en blanco es silencio digital.
+1. **Últimas canciones**: todas las canciones de la sesión (no solo las últimas que caben en la tabla), de la primera a la última, con las mismas columnas de la tabla más una «Nota» (corta / empezó tras una pausa o un corte). Los números son números, con filtros, y los saltos y true peak sobre el umbral van marcados como en la ventana. Un true peak en blanco es silencio digital.
 2. **Promedios de la sesión**: el panel de la ventana, un valor por celda con su unidad, más el nombre, el inicio y las horas grabadas.
 3. **Data LUFS**: los datos del gráfico, un punto por segundo de audio: hora, segundo de audio, short-term (3 s; −60 = silencio) y LUFS integrado de la canción en curso. Una pausa se nota como un salto en la hora.
 4. **Registro**: el `registro.log` completo de la sesión. Excel no admite más de 32 767 caracteres en una celda, así que un registro largo (una sesión de 13 h ocupa unos 100 000) empieza en **A1 y sigue en A2, A3…**, cortado entre líneas; la app avisa cuántas celdas ocupó.
@@ -45,11 +55,14 @@ Por defecto se guarda en la carpeta de la sesión como `<sesión> - resultados.x
 Lo mismo que el script (WAV por hora, `pistas.csv`, `reloj.csv`, `sesion.json`), más:
 - `mediciones.f32`: por cada bloque de 100 ms, energía K-ponderada por canal, pico de muestra y true peak. Con esto se recalcula cualquier métrica sin el audio.
 - `registro.log`: lo mismo que el registro de la ventana.
+- `latido.json`: cada 5 s, hasta dónde llegó la grabación y a qué hora. Si la grabación se corta, de ahí sale cuándo empezó el corte.
 - En `pistas.csv`, las filas `pausa` y `reanuda` (mismo frame) marcan cada pausa. `sesion.json` trae la configuración completa (`config`), las pausas (`pausas`, con su duración) y `segundos_en_pausa`. `analizar.py` las entiende: corta la canción en la pausa, no calcula saltos a través de ella, y en `curva_100ms.csv` la hora real descuenta el tiempo pausado (el audio no lo incluye, el reloj sí).
 - `picos/` y `picos.csv`: un recorte de 20 s por cada cambio de canción con un salto notorio (Configuración › Umbrales › «Marcar saltos desde», 3 LU por defecto, sube o baja): los últimos 10 s de la canción que terminó y los primeros 10 s de la que empezó, que son los tramos con que se mide el salto. El corte cae en el segundo 10 del recorte. El nombre lleva el número, la hora aproximada, el salto y los títulos (`0001_155413_+7.0LU_Beck - Loser_a_Olly Murs….wav`); si la ruta es muy larga, queda solo con número, hora y salto. `picos.csv` trae el detalle (títulos, LUFS de cada tramo, posición exacta en la grabación). El recorte aparece unos 30 s después del cambio, cuando la canción nueva cumple la duración mínima: una canción más corta no cuenta como cambio y no deja recorte. Son copias, la grabación completa queda intacta. Ocupan ~7 MB cada uno.
 
 ### Si algo falla
-`registro.log` de la sesión, y en `%APPDATA%\LoudnessLab\`: `motor.log` (arranque del motor) y `caidas.log` (traza si el proceso se cae).
+`registro.log` de la sesión, y en `%APPDATA%\LoudnessLab\`: `motor.log` (arranque del motor, y cada vez que el guardián retoma una sesión) y `caidas.log` (traza si el proceso se cae).
+
+Para quitar el guardián de Windows (la app lo vuelve a registrar al abrirse): `schtasks /Delete /TN "\LoudnessLab\Guardian" /F`.
 
 Para reconstruir el .exe después de cambiar el código: `construir.bat` (también rehace el acceso directo).
 

@@ -43,6 +43,12 @@ def _misma_carpeta(a, b):
     return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
 
 
+def es_abierta(carpeta):
+    """La sesión sigue abierta: se cortó (o se está retomando) y el próximo motor la continúa."""
+    d = protocolo.leer_abierta()
+    return bool(d) and _misma_carpeta(d["carpeta"], carpeta)
+
+
 def nombre_libre(base, nombre):
     """El nombre pedido o, si ya hay una sesión así, el mismo con _2, _3…"""
     nombre = limpiar_nombre(nombre)
@@ -69,8 +75,10 @@ def listar(base):
             continue
         if en_curso and _misma_carpeta(carpeta, en_curso):
             estado = "en curso"
+        elif s.get("fin_pc"):
+            estado = "terminada"
         else:
-            estado = "terminada" if s.get("fin_pc") else "interrumpida"
+            estado = "cortada: se retoma sola" if es_abierta(carpeta) else "interrumpida"
         out.append({"nombre": s.get("etiqueta") or n, "carpeta": carpeta, "inicio": s.get("inicio_pc") or "",
                     "inicio_epoch": _epoch(s.get("inicio_pc")) or os.path.getmtime(carpeta),
                     "horas": float(s.get("segundos_totales") or 0) / 3600,
@@ -80,14 +88,19 @@ def listar(base):
     return out
 
 
+INICIO_HUECO = ("pausa", "corte")     # desde aquí no se grabó: una pausa, o un corte del motor
+FIN_HUECO = ("reanuda", "retoma")
+
+
 def pausas_de(eventos, sr):
-    """(segundo de audio, duración en s) de cada pausa de la grabación, según los eventos
-    pausa/reanuda de pistas.csv. El audio de una pausa no se graba: el reloj del PC sigue y el audio no."""
+    """(segundo de audio, duración en s) de cada tramo sin grabar, según los eventos de pistas.csv:
+    pausa/reanuda (las pausas) y corte/retoma (el motor se cortó y se retomó solo). El audio de esos
+    tramos no existe: el reloj del PC sigue y el audio no."""
     out, abierta = [], None
     for e in eventos:
-        if e["evento"] == "pausa":
+        if e["evento"] in INICIO_HUECO:
             abierta = e
-        elif e["evento"] == "reanuda" and abierta is not None:
+        elif e["evento"] in FIN_HUECO and abierta is not None:
             try:
                 dur = (dt.datetime.fromisoformat(e["hora_pc"])
                        - dt.datetime.fromisoformat(abierta["hora_pc"])).total_seconds()
@@ -98,6 +111,49 @@ def pausas_de(eventos, sr):
     if abierta is not None:   # la sesión terminó en pausa
         out.append((int(abierta["frame_global"]) / sr, 0.0))
     return out
+
+
+def cortes_de(eventos, sr):
+    """Los cortes (el motor murió y se retomó solo): segundo de audio, desde, hasta, duración y motivo."""
+    out, abierto = [], None
+    for e in eventos:
+        if e["evento"] == "corte":
+            abierto = e
+        elif e["evento"] == "retoma" and abierto is not None:
+            try:
+                dur = (dt.datetime.fromisoformat(e["hora_pc"])
+                       - dt.datetime.fromisoformat(abierto["hora_pc"])).total_seconds()
+            except (ValueError, TypeError, KeyError):
+                dur = 0.0
+            out.append({"t_s": int(abierto["frame_global"]) / sr, "desde": abierto["hora_pc"], "hasta": e["hora_pc"],
+                        "duracion_s": dur, "motivo": abierto.get("estado") or ""})
+            abierto = None
+    return out
+
+
+def cerrar_abierta(carpeta, motivo):
+    """Da por terminada una sesión abierta cuyo motor no está corriendo (se cortó y no se pudo o no
+    se quiere retomar). Desde ahí es una sesión terminada más."""
+    ruta = os.path.join(carpeta, "sesion.json")
+    s = _json(ruta)
+    if s is not None and not s.get("fin_pc"):
+        # los archivos quedaron como los dejó el corte: se reparan igual que al retomar
+        from . import recuperar
+        try:
+            archivos, total, _, _ = recuperar.preparar(carpeta, int(s.get("sample_rate") or 48000),
+                                                       int(s.get("canales") or 2), s.get("archivos"))
+            s.update(archivos=[{k: a[k] for k in ("archivo", "frame_global_inicio", "hora_pc_inicio")}
+                               for a in archivos],
+                     frames_totales=total, segundos_totales=total / int(s.get("sample_rate") or 48000))
+        except Exception:
+            pass
+        s["fin_pc"] = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+        s["motivo_fin"] = motivo
+        tmp = ruta + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2, ensure_ascii=False, default=float)
+        os.replace(tmp, ruta)
+    protocolo.borrar_abierta(carpeta)
 
 
 def _config_de(s, carpeta):
@@ -142,18 +198,13 @@ def _log(carpeta, maximo=500):
             for l in lineas]
 
 
-def reconstruir(carpeta):
-    """Lo que la ventana recibe de un motor al conectarse (un «snapshot»), armado desde los archivos
-    de una sesión que ya no graba."""
-    s = _json(os.path.join(carpeta, "sesion.json"))
-    if s is None:
-        raise ValueError(f"«{carpeta}» no es una sesión: falta sesion.json.")
-    cfg = _config_de(s, carpeta)
+def repasar(carpeta, s, cfg):
+    """Pasa mediciones.f32 y pistas.csv por un Seguidor nuevo, en el orden en que ocurrieron: queda
+    como estaba el de la grabación en ese punto. Devuelve (seguidor, eventos, bloques)."""
     sr, ch = int(s.get("sample_rate") or 48000), int(s.get("canales") or 2)
     blk = sr // 10
     seg = Seguidor(min_dur=float(cfg.get("min_dur") or 30), refinar_s=3.0,
                    umbral_salto=float(cfg.get("umbral_salto") or 3.0))
-
     try:
         datos = np.fromfile(os.path.join(carpeta, "mediciones.f32"), dtype=np.float32)
     except OSError:
@@ -173,10 +224,24 @@ def reconstruir(carpeta):
         seg.evento(e, b)
     if pos < n:
         seg.agregar(z[pos:], sp[pos:], tp[pos:])
+    return seg, eventos, n
+
+
+def reconstruir(carpeta):
+    """Lo que la ventana recibe de un motor al conectarse (un «snapshot»), armado desde los archivos
+    de una sesión que ya no graba."""
+    s = _json(os.path.join(carpeta, "sesion.json"))
+    if s is None:
+        raise ValueError(f"«{carpeta}» no es una sesión: falta sesion.json.")
+    cfg = _config_de(s, carpeta)
+    sr = int(s.get("sample_rate") or 48000)
+    seg, eventos, n = repasar(carpeta, s, cfg)
     seg.terminar()
 
     idx = np.arange(9, n, 10)   # un punto por segundo, como en vivo
     pausas = [[t, d] for t, d in pausas_de(eventos, sr)]
+    cortes = cortes_de(eventos, sr)
+    n_pausas = sum(1 for e in eventos if e["evento"] == "pausa")
     archivos = s.get("archivos") or []
     inicio = (_epoch(archivos[0].get("hora_pc_inicio")) if archivos else None) or _epoch(s.get("inicio_pc")) \
         or os.path.getmtime(carpeta)
@@ -194,7 +259,9 @@ def reconstruir(carpeta):
         "cerrada": {"nombre": nombre, "terminada": terminada, "motivo": s.get("motivo_fin") or "",
                     "inicio_pc": s.get("inicio_pc") or "", "fin_pc": s.get("fin_pc") or "",
                     "horas": n / 36000, "canciones": estadisticas["canciones"],
-                    "segundos_en_pausa": float(sum(d for _, d in pausas)), "pausas": len(pausas),
+                    "segundos_en_pausa": float(sum(d for _, d in pausas)) - sum(c["duracion_s"] for c in cortes),
+                    "pausas": n_pausas, "cortes": cortes,
+                    "abierta": not terminada and es_abierta(carpeta),
                     "dispositivo": s.get("dispositivo", ""), "app": cfg.get("app", ""),
                     "perdidas": int(s.get("overflows") or 0)},
     }

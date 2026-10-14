@@ -30,7 +30,7 @@ import soundfile as sf
 # implementación, para que los números en vivo y los del informe no diverjan.
 from loudness_lab.bs1770 import (SILENCIO, MedidorBloques, db, integrado, lra, lufs,  # noqa: F401
                                  media_movil, refinar_corte)
-from loudness_lab.sesiones import pausas_de
+from loudness_lab.sesiones import cortes_de, pausas_de
 
 
 # ----------------------------------------------------------------------------
@@ -90,7 +90,8 @@ def leer_pistas(carpeta, blk_frames):
 def segmentar(eventos, mom, n_bloques, refinar_s):
     """Convierte los eventos en segmentos [inicio, fin) por canción.
 
-    Una pausa de la grabación (evento «pausa») corta la canción en curso. La que suena al reanudar
+    Una pausa de la grabación (evento «pausa») o un corte del motor (evento «corte») corta la canción
+    en curso. La que suena al reanudar
     llega empezada (tras_pausa): no se junta con la de antes y su corte no se ajusta hacia el otro
     lado de la pausa, que no es continuación de este."""
     ventana = int(refinar_s * 10)
@@ -99,11 +100,11 @@ def segmentar(eventos, mom, n_bloques, refinar_s):
     sig_pausa, prox = [None] * len(eventos), None
     for i in range(len(eventos) - 1, -1, -1):
         sig_pausa[i] = prox
-        if eventos[i]["evento"] == "pausa":
+        if eventos[i]["evento"] in ("pausa", "corte"):
             prox = eventos[i]["bloque"]
     cortes, piso, tras = [], 0, False
     for i, e in enumerate(eventos):
-        if e["evento"] == "pausa":
+        if e["evento"] in ("pausa", "corte"):   # (corte: el motor se cortó y se retomó solo)
             cortes.append((e["bloque"], dict(e, titulo=None), False, False))
             piso, tras = e["bloque"], True
         elif e["evento"] == "cambio_pista" and e.get("titulo"):
@@ -165,7 +166,8 @@ def analizar_sesion(carpeta, args):
 
     # Las pausas de la grabación: el audio no las incluye, pero el reloj del PC sí.
     eventos = leer_pistas(carpeta, sr // 10)
-    pausas = pausas_de(eventos, sr)
+    pausas = pausas_de(eventos, sr)        # pausas y cortes
+    cortes = cortes_de(eventos, sr)
     desplazamiento = np.zeros(n)   # segundos de pausa que hubo antes de cada bloque
     for t_pausa, duracion in pausas:
         desplazamiento[t > t_pausa] += duracion
@@ -239,7 +241,9 @@ def analizar_sesion(carpeta, args):
     resumen = {
         "etiqueta": etiqueta, "carpeta": os.path.basename(os.path.normpath(carpeta)), "notas": sesion.get("notas", ""), "inicio_pc": sesion.get("inicio_pc"),
         "horas_grabadas": round(n / 36000, 2), "horas_con_musica": round(float(musica.sum()) / 36000, 2),
-        "pausas": len(pausas), "segundos_en_pausa": round(sum(d for _, d in pausas), 1),
+        "pausas": sum(1 for e in eventos if e["evento"] == "pausa"),
+        "segundos_en_pausa": round(sum(d for _, d in pausas) - sum(c["duracion_s"] for c in cortes), 1),
+        "cortes": len(cortes), "segundos_en_cortes": round(sum(c["duracion_s"] for c in cortes), 1),
         "lufs_integrado_sesion": integrado(z, 0, n),
         "lra_sesion_lu": lra(z, 0, n),
         "truepeak_max_dbtp": float(tpd.max()),

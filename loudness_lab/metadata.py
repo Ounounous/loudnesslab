@@ -224,9 +224,11 @@ class HiloSimulado(threading.Thread):
     def run(self):
         leidas = 0
         en_pausa = False
+        nuevo = not os.path.exists(self.ruta)
         with open(self.ruta, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=CAMPOS)
-            w.writeheader()
+            if nuevo:
+                w.writeheader()
             while not self.detener.is_set():
                 while not self.marcas.empty():
                     evento, hora, (fg, arch, fpos) = self.marcas.get_nowait()

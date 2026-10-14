@@ -116,7 +116,7 @@ def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
             tp = p.get("tp")
             _num(h1, i, 5, None if not _vacio(tp) and tp <= -200 else tp, f_1)   # −240 = silencio digital
             _num(h1, i, 6, p.get("salto"), f_s1)
-            nota = "corta: no cuenta" if p.get("corta") else ("empezó tras una pausa" if p.get("tras_pausa") else "")
+            nota = "corta: no cuenta" if p.get("corta") else ("empezó tras una pausa o un corte" if p.get("tras_pausa") else "")
             if nota:
                 h1.write_string(i, 7, nota, f_gris)
         if pistas:
