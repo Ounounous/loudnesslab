@@ -101,10 +101,12 @@ def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
         # ---- hoja 1: canciones (las mismas columnas de la tabla, de la primera a la última)
         h1 = libro.add_worksheet(HOJAS[0])
         h1.freeze_panes(1, 0)
-        for c, ancho in enumerate((19, 70, 8, 8, 8, 10, 8, 30)):
+        for c, ancho in enumerate((19, 70, 8, 8, 8, 10, 8, 30, 30, 40, 36)):
             h1.set_column(c, c, ancho)
         h1.set_row(0, 20)
-        for c, t in enumerate(("Inicio", "Artista – Título", "Dur.", "LUFS", "LRA", "True peak", "Salto", "Nota")):
+        # Artista, Título y Álbum por separado al final: sirven para armar la misma lista en otra app
+        for c, t in enumerate(("Inicio", "Artista – Título", "Dur.", "LUFS", "LRA", "True peak", "Salto", "Nota",
+                               "Artista", "Título", "Álbum")):
             h1.write_string(0, c, t, enc)
         inicios = serie_excel([p["inicio_epoch"] for p in pistas])
         for i, p in enumerate(pistas, start=1):
@@ -119,8 +121,11 @@ def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
             nota = "corta: no cuenta" if p.get("corta") else ("empezó tras una pausa o un corte" if p.get("tras_pausa") else "")
             if nota:
                 h1.write_string(i, 7, nota, f_gris)
+            for c, k in ((8, "artista"), (9, "titulo"), (10, "album")):
+                if p.get(k):
+                    h1.write_string(i, c, str(p[k]), f_txt)
         if pistas:
-            h1.autofilter(0, 0, len(pistas), 7)
+            h1.autofilter(0, 0, len(pistas), 10)
             # lo mismo que marca la tabla: salto sobre el umbral (amarillo), sobre 5 LU (rojo), true peak sobre −1
             h1.conditional_format(1, 6, len(pistas), 6, {"type": "cell", "criteria": "not between",
                                   "minimum": -5, "maximum": 5, "format": rojo, "stop_if_true": True})

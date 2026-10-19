@@ -41,6 +41,7 @@ from . import VERSION, dispositivos, protocolo, recuperar, sesiones, sistema
 from .bs1770 import MedidorBloques
 from .metadata import CAMPOS, HiloMetadata, HiloSimulado
 from .picos import SEG_ANTES, SEG_DESPUES, GuardaPicos
+from .radio import HiloRadio
 from .seguimiento import Seguidor, Serie
 
 SEG_POR_ARCHIVO = 3600
@@ -410,6 +411,7 @@ class Motor:
         self.reparaciones = []
         self._descartar = 0        # filas del medidor calentado que ya estaban medidas
         self.ult_latido = 0.0
+        self.radio = None          # con una radio web, el lector de títulos de su stream (necesita el audio)
         self.cola_audio = queue.Queue()
         self.cola_eventos = queue.Queue()
         self.publicador = Publicador()
@@ -531,6 +533,11 @@ class Motor:
                       "segundos_despues": SEG_DESPUES,
                       "nota": "un recorte por cada cambio de canción con |salto| sobre umbral_salto"},
             "checklist": cfg.get("checklist", {}), "prueba_cadena": cfg.get("prueba_cadena"),
+            "titulos": ({"fuente": "stream de la radio (metadatos ICY), ubicados por alineación con el audio",
+                         "stream_url": cfg.get("stream_url"), "ajuste_titulo_s": float(cfg.get("ajuste_titulo_s") or 0.0),
+                         "registro": "radio.csv"}
+                        if (cfg.get("stream_url") or "").strip() else
+                        {"fuente": "panel multimedia de Windows", "app": cfg.get("app", "")}),
             "equipo": {"windows": platform.platform(), "nombre": platform.node()},
             "mediciones": {"archivo": "mediciones.f32", "tipo": "float32", "bloque_ms": 100,
                            "columnas": [f"z_canal{i}" for i in range(self.ch)] + ["sample_peak", "true_peak"],
@@ -554,8 +561,14 @@ class Motor:
             self._escribir_corte()
 
         pistas = os.path.join(self.carpeta, "pistas.csv")
+        url = (cfg.get("stream_url") or "").strip()
         if cfg.get("_simular_avisos"):
             self.meta = HiloSimulado(pistas, self.escritor.posicion, cfg["_simular_avisos"], self.cola_eventos.put)
+        elif url:
+            # una radio web que no publica el título en Windows: se lee de su stream (ver radio.py)
+            self.meta = HiloRadio(pistas, self.escritor.posicion, url, self.cola_eventos.put, self.sr,
+                                  ajuste_s=float(cfg.get("ajuste_titulo_s") or 0.0))
+            self.radio = self.meta
         else:
             self.meta = HiloMetadata(pistas, self.escritor.posicion, cfg.get("app", ""), self.cola_eventos.put)
         self.meta.start()
@@ -822,6 +835,8 @@ class Motor:
             bloque[:self.silenciar_hasta - inicio] = 0.0
         self.escritor.escribir(bloque)
         self.picos.alimentar(inicio, bloque)
+        if self.radio is not None:
+            self.radio.alimentar(inicio, bloque)
         self.monitor.alimentar(bloque)
         self._medir(*self.medidor.procesar(bloque))
 
@@ -987,8 +1002,11 @@ class Motor:
         self._alerta("ruta", self.estado_app == "reproduciendo" and sil >= 10,
                      f"La app dice que está reproduciendo, pero no llega audio a {self.nombre_dispositivo}. "
                      "Revisa que su salida sea ese dispositivo (Sistema > Sonido > Mezclador de volumen).")
+        if self.radio is not None:
+            aviso = self.radio.aviso
+            self._alerta("radio", bool(aviso), aviso)
         app = self.cfg.get("app")
-        self._alerta("metadata", bool(app) and self.sin_meta_desde is not None
+        self._alerta("metadata", self.radio is None and bool(app) and self.sin_meta_desde is not None
                      and time.time() - self.sin_meta_desde > 30,
                      f"No encuentro '{app}' en el panel multimedia de Windows: no se están registrando las canciones.")
 

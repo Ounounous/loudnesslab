@@ -11,7 +11,17 @@ APP_POR_FUENTE = {
     "Spotify": "spotify",
     "YouTube (navegador)": "chrome",
     "Archivos locales": "zunemusic",   # Reproductor multimedia de Windows
+    "Mystify (radio web)": "chrome",
     "Otra": "",
+}
+
+# Radios web que no publican el título en Windows: se lee de su stream (ver radio.py). `ajuste_s`: cuánto
+# después del título suele estar el borde real entre canciones en esa radio; el ajuste fino de ±3 s busca
+# el hueco alrededor de ese punto, como con cualquier otra fuente.
+# Mystify (19-10-2026, 16 cambios): el hueco entre canciones cae a +2,2 s del título (mediana; cuartiles
+# +1,5 … +3,7 s). Con +2,0 s el corte queda en el hueco en 12 de 15 cambios con hueco claro.
+STREAM_POR_FUENTE = {
+    "Mystify (radio web)": {"url": "https://radio.mystify.cl:8230/radio.mp3", "ajuste_s": 2.0},
 }
 
 
@@ -28,6 +38,8 @@ class Config:
     etiqueta: str = ""
     # captura
     app: str = "spotify"
+    stream_url: str = ""           # radio web: los títulos se leen de su stream y no del panel de Windows
+    ajuste_titulo_s: float = 0.0   # radio web: el borde entre canciones suele estar estos segundos después del título
     dispositivo: str = ""          # nombre de la salida que se graba (por defecto, el cable)
     horas: float = 0.0             # 0 = hasta detener
     # escucha

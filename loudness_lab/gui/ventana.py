@@ -28,7 +28,7 @@ import pyqtgraph as pg
 
 from .. import VERSION, excel, guardian, protocolo, sesiones, sistema
 from .. import config as cfgmod
-from ..config import APP_POR_FUENTE
+from ..config import APP_POR_FUENTE, STREAM_POR_FUENTE
 from ..seguimiento import Serie
 
 ACENTO = "#2f6db5"
@@ -615,6 +615,11 @@ class PestanaVivo(QWidget):
                     registro = f.read()
             except OSError:
                 pass
+            from .. import radio
+            alb = radio.albumes(carpeta)    # una radio web: el álbum que la API informó después
+            for d in pistas:
+                if not d.get("album"):
+                    d["album"] = alb.get(f"{d.get('artista', '')} - {d.get('titulo', '')}".strip(), "")
         if registro is None:
             registro = self.registro.toPlainText()
         return {"inicio_epoch": self.inicio_epoch, "horas": self.segundos / 3600, "pistas": pistas,
@@ -718,6 +723,24 @@ class PestanaConfig(QWidget):
         self.lbl_apps.setStyleSheet(f"color:{GRIS}")
         self.lbl_apps.setWordWrap(True)
         self.lbl_apps.hide()
+        self.stream_url = QLineEdit(cfg.stream_url)
+        self.stream_url.setPlaceholderText("vacío: los títulos se leen del panel multimedia de Windows")
+        self.stream_url.setToolTip("Para una radio web que no publica qué suena en Windows (Mystify): la dirección "
+                                   "de su stream. El motor lee de ahí los títulos y los ubica en la grabación "
+                                   "comparando ese stream con el audio que se graba.")
+        self.ajuste_titulo = QDoubleSpinBox()
+        self.ajuste_titulo.setRange(-10, 10)
+        self.ajuste_titulo.setDecimals(1)
+        self.ajuste_titulo.setSingleStep(0.1)
+        self.ajuste_titulo.setSuffix(" s")
+        self.ajuste_titulo.setValue(cfg.ajuste_titulo_s)
+        self.ajuste_titulo.setToolTip("Cuánto después del título suele estar el borde real entre canciones en esta "
+                                      "radio (medido). El cambio se anota ahí y el ajuste fino busca el hueco en ±3 s, "
+                                      "como con las otras fuentes. Se completa solo al elegir la fuente.")
+        fila_stream = QHBoxLayout()
+        fila_stream.addWidget(self.stream_url, 1)
+        fila_stream.addWidget(QLabel("ajuste"))
+        fila_stream.addWidget(self.ajuste_titulo)
 
         self.dispositivo = QComboBox()
         b_actualizar = QPushButton("Actualizar")
@@ -773,6 +796,7 @@ class PestanaConfig(QWidget):
         f2.addRow("Grabar desde", fila_disp)
         f2.addRow("App a seguir", fila_app)
         f2.addRow("", self.lbl_apps)
+        f2.addRow("Títulos de la radio (stream)", fila_stream)
         f2.addRow("Escuchar en", self.monitor_disp)
         f2.addRow("Duración", self.horas)
         ayuda = QLabel("Para grabar sin que suene, en Windows envía la app de música a «CABLE Input» "
@@ -806,14 +830,14 @@ class PestanaConfig(QWidget):
         externo.addWidget(scroll)
         self.grupos = (g_destino, g_cond, g_cap, g_umb)
 
-        for w in (self.carpeta, self.playlist, self.crossfade, self.calidad, self.etiqueta):
+        for w in (self.carpeta, self.playlist, self.crossfade, self.calidad, self.etiqueta, self.stream_url):
             w.textChanged.connect(self._avisar)
         self.notas.textChanged.connect(self._avisar)
         for w in (self.normalizacion, self.app):
             w.currentTextChanged.connect(self._avisar)
         for w in (self.dispositivo, self.monitor_disp):
             w.currentIndexChanged.connect(self._avisar)
-        for w in (self.horas, self.umbral, self.silencio, self.min_dur):
+        for w in (self.horas, self.umbral, self.silencio, self.min_dur, self.ajuste_titulo):
             w.valueChanged.connect(self._avisar)
         self._cargando = False
 
@@ -830,6 +854,9 @@ class PestanaConfig(QWidget):
         app = APP_POR_FUENTE.get(fuente)
         if app is not None:
             self.app.setCurrentText(app)
+        radio = STREAM_POR_FUENTE.get(fuente) or {}
+        self.stream_url.setText(radio.get("url", ""))
+        self.ajuste_titulo.setValue(float(radio.get("ajuste_s", 0.0)))
         self._avisar()
 
     def _sugerir_etiqueta(self):
@@ -912,7 +939,9 @@ class PestanaConfig(QWidget):
             playlist=self.playlist.text().strip(), normalizacion=self.normalizacion.currentText().strip(),
             crossfade=self.crossfade.text().strip(), calidad=self.calidad.text().strip(),
             notas=self.notas.toPlainText().strip(), etiqueta=self.etiqueta.text().strip(),
-            app=self.app.currentText().strip(), dispositivo=self.dispositivo.currentData() or self._disp_guardado,
+            app=self.app.currentText().strip(), stream_url=self.stream_url.text().strip(),
+            ajuste_titulo_s=self.ajuste_titulo.value(),
+            dispositivo=self.dispositivo.currentData() or self._disp_guardado,
             horas=self.horas.value(), monitor=self.monitor,
             monitor_dispositivo=(self.monitor_disp.currentData() if self.monitor_disp.count() else self._monitor_guardado) or "",
             monitor_vol=self.monitor_vol, umbral_salto=self.umbral.value(),
@@ -931,6 +960,8 @@ class PestanaConfig(QWidget):
         self.notas.setPlainText(c.get("notas", ""))
         self.etiqueta.setText(c.get("etiqueta", ""))
         self.app.setCurrentText(c.get("app", ""))
+        self.stream_url.setText(c.get("stream_url", ""))
+        self.ajuste_titulo.setValue(float(c.get("ajuste_titulo_s") or 0.0))
         self.horas.setValue(float(c.get("horas") or 0))
         self.umbral.setValue(float(c.get("umbral_salto") or self.umbral.value()))
         self.silencio.setValue(float(c.get("alerta_silencio_min") or self.silencio.value()))
@@ -1032,8 +1063,15 @@ class PestanaChequeo(QWidget):
         cfg = self.v.pestana_config.leer()
 
         def trabajo():
-            return {"disp": dispositivos.listar(), "apps": metadata.listar_apps(),
-                    "libre": sistema.espacio_libre_gb(cfg.carpeta_salida)}
+            r = {"disp": dispositivos.listar(), "apps": metadata.listar_apps(),
+                 "libre": sistema.espacio_libre_gb(cfg.carpeta_salida)}
+            if cfg.stream_url:
+                from .. import radio
+                try:
+                    r["radio"] = ("ok", radio.probar(cfg.stream_url))
+                except Exception as e:
+                    r["radio"] = ("mal", str(e))
+            return r
 
         self._limpiar()
         self._fila("aviso", "Revisando…")
@@ -1065,7 +1103,14 @@ class PestanaChequeo(QWidget):
         else:
             self._fila("ok", f"La salida predeterminada es {pred}: los demás sonidos del PC no se graban")
         apps = r["apps"]
-        if apps is None:
+        if cfg.stream_url:
+            estado, texto = r.get("radio", ("mal", "sin respuesta"))
+            if estado == "ok":
+                self._fila("ok", f"La radio manda los títulos en su stream (suena: {texto}). Se ubican en la "
+                                 "grabación comparando ese stream con el audio que llega al cable.")
+            else:
+                self._fila("mal", f"No pude leer los títulos del stream de la radio ({cfg.stream_url}): {texto}")
+        elif apps is None:
             self._fila("mal", "Falta el componente de Windows para leer qué canción suena.")
         elif not cfg.app:
             self._fila("aviso", "No elegiste qué app seguir: se tomará la que Windows considere activa.")
