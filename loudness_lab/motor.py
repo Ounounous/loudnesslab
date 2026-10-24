@@ -20,6 +20,7 @@ Una sesión queda abierta hasta que se detiene (o se cumple su duración). Si el
 
 import argparse
 import csv
+import shutil
 import datetime as dt
 import json
 import logging
@@ -37,7 +38,10 @@ from pathlib import Path
 
 import numpy as np
 
-from . import VERSION, dispositivos, protocolo, recuperar, sesiones, sistema
+from . import VERSION, capa, dispositivos, protocolo, recuperar, sesiones, sistema, sonoridad, zwicker
+from .bandas import METADATOS as METADATOS_ESPECTRO
+from .bandas import N_BANDAS, espectro_cancion
+from .config import normalizacion_de, servicio_de
 from .bs1770 import MedidorBloques
 from .metadata import CAMPOS, HiloMetadata, HiloSimulado
 from .picos import SEG_ANTES, SEG_DESPUES, GuardaPicos
@@ -411,6 +415,9 @@ class Motor:
         self.reparaciones = []
         self._descartar = 0        # filas del medidor calentado que ya estaban medidas
         self.ult_latido = 0.0
+        self.f_espectro = None     # espectro.f32: la capa de frecuencias, medida en vivo
+        self.esp_ultimas = deque(maxlen=30)    # bandas de los últimos 3 s (para la ventana)
+        self.esp_cancion = [None, np.zeros(N_BANDAS), 0]   # [bloque de inicio, suma, bloques] de la canción en curso
         self.radio = None          # con una radio web, el lector de títulos de su stream (necesita el audio)
         self.cola_audio = queue.Queue()
         self.cola_eventos = queue.Queue()
@@ -506,14 +513,31 @@ class Motor:
                                    f"grabó con {sr0} Hz y {ch0}: así no se puede continuar la misma sesión.")
 
         self.escritor = Escritor(self.carpeta, self.sr, self.ch)
-        self.medidor = MedidorBloques(self.sr, self.ch)
+        self.medidor = MedidorBloques(self.sr, self.ch, bandas=True)
         self.seguidor = Seguidor(min_dur=float(cfg.get("min_dur", 30)), refinar_s=3.0,
-                                 umbral_salto=float(cfg.get("umbral_salto", 3.0)))
+                                 umbral_salto=float(cfg.get("umbral_salto", 3.0)),
+                                 nivel_aplica=sesiones.nivel_aplica(cfg), bandas_de=self._leer_espectro,
+                                 sr=self.sr)
         if self.previa is not None:
             self._preparar_continuacion()
         else:
             self.picos = GuardaPicos(self.carpeta, self.sr, float(cfg.get("min_dur", 30)))
         self.f_bloques = open(os.path.join(self.carpeta, "mediciones.f32"), "ab")
+        # La capa de frecuencias se mide en vivo en una sesión nueva, o al retomar una que ya la tenía
+        # completa. (Una sesión de antes de v0.2 retomada no la tiene: se genera después desde el audio.)
+        if self.previa is None or capa.filas_espectro(self.carpeta) == self.seguidor.n:
+            self.f_espectro = open(os.path.join(self.carpeta, "espectro.f32"), "ab")
+            self.seguidor.bandas_de = self._leer_espectro     # (vacía a disco lo pendiente antes de leer)
+            # la sonoridad percibida, un valor por segundo (al retomar, repasar ya calculó lo anterior)
+            if self.seguidor.sonoridad is None:
+                nivel, campo = sonoridad.de_sesion(self.previa, cfg)
+                self.seguidor.sonoridad = sonoridad.Sonoridad(self._leer_espectro, nivel, campo,
+                                                              desde=-(-self.seguidor.n // 10))
+            else:
+                self.seguidor.sonoridad.leer = self._leer_espectro
+        else:
+            self.seguidor.bandas_de = None
+            self.seguidor.sonoridad = None
         ruta_reloj = os.path.join(self.carpeta, "reloj.csv")
         reloj_nuevo = not os.path.exists(ruta_reloj)
         self.f_reloj = open(ruta_reloj, "a", newline="", encoding="utf-8")
@@ -525,7 +549,9 @@ class Motor:
             "app": f"Loudness Lab {VERSION}",
             "etiqueta": self.etiqueta, "notas": cfg.get("notas", ""),
             "config": {k: v for k, v in cfg.items() if not k.startswith("_") and k != "ultima_sesion"},
-            "condiciones": {k: cfg.get(k, "") for k in ("fuente", "playlist", "normalizacion", "crossfade", "calidad")},
+            "condiciones": self._condiciones(cfg),
+            "estudio": {"servicio": servicio_de(cfg.get("fuente")), "playlist": cfg.get("playlist", ""),
+                        "estado": "valida", "tramos_excluidos": [], "notas": ""},
             "inicio_pc": ahora_iso(), "dispositivo": nombre, "sample_rate": self.sr, "canales": self.ch,
             "formato": "WAV float32", "segundos_por_archivo": SEG_POR_ARCHIVO, "filtro_app": cfg.get("app", ""),
             "umbrales": {k: cfg.get(k) for k in ("umbral_salto", "alerta_silencio_min", "min_dur")},
@@ -533,6 +559,9 @@ class Motor:
                       "segundos_despues": SEG_DESPUES,
                       "nota": "un recorte por cada cambio de canción con |salto| sobre umbral_salto"},
             "checklist": cfg.get("checklist", {}), "prueba_cadena": cfg.get("prueba_cadena"),
+            "checklist_completa": cfg.get("checklist_completa"), "grabada_sin_chequeo": cfg.get("grabada_sin_chequeo"),
+            "espectro": ({**METADATOS_ESPECTRO, "origen": "en vivo"} if self.f_espectro is not None else None),
+            "sonoridad": self.seguidor.sonoridad.metadatos() if self.seguidor.sonoridad is not None else None,
             "titulos": ({"fuente": "stream de la radio (metadatos ICY), ubicados por alineación con el audio",
                          "stream_url": cfg.get("stream_url"), "ajuste_titulo_s": float(cfg.get("ajuste_titulo_s") or 0.0),
                          "registro": "radio.csv"}
@@ -651,11 +680,12 @@ class Motor:
         for item in sesiones._log(self.carpeta):
             self.log_reciente.append(item)
         self._recuperar_picos(seg.saltos_notorios, archivos)
-        seg.saltos_notorios, seg.nuevas = [], []
+        seg.saltos_notorios, seg.nuevas, seg.alertas_nuevas = [], [], []
         self.stats = seg.estadisticas()
         self.desfase = float(lat.get("desfase") or 0.0)
         # el medidor sigue con el estado que tenía, como si el audio fuera de corrido
-        self.medidor, self._descartar = recuperar.medidor_calentado(self.carpeta, archivos, self.sr, self.ch, bloques)
+        self.medidor, self._descartar = recuperar.medidor_calentado(self.carpeta, archivos, self.sr, self.ch, bloques,
+                                                                    bandas=True)
 
     def _recuperar_picos(self, saltos, archivos):
         """Los recortes de saltos que se detectaron pero no alcanzaron a guardarse antes del corte se
@@ -799,6 +829,7 @@ class Motor:
             self._procesar_conexiones()
             self._procesar_comandos()
             self._publicar_pistas()
+            self._publicar_alertas_estado()
             self._guardar_picos()
             if ahora - ult_seg >= 1:
                 self._cada_segundo()
@@ -840,23 +871,86 @@ class Motor:
         self.monitor.alimentar(bloque)
         self._medir(*self.medidor.procesar(bloque))
 
-    def _medir(self, zc, sp, tp):
+    def _medir(self, zc, sp, tp, bb):
         if self._descartar and len(sp):   # el medidor calentado entrega primero bloques ya medidos
             k = min(self._descartar, len(sp))
-            zc, sp, tp = zc[k:], sp[k:], tp[k:]
+            zc, sp, tp, bb = zc[k:], sp[k:], tp[k:], bb[k:]
             self._descartar -= k
         if not len(sp):
             return
         self.f_bloques.write(np.column_stack([zc, sp, tp]).astype(np.float32).tobytes())
+        if self.f_espectro is not None:
+            self.f_espectro.write(bb.astype(np.float32).tobytes())
         n0 = self.seguidor.n
         self.seguidor.agregar(zc.sum(axis=1), sp, tp)
         st = self.seguidor.st.v
+        self._seguir_bandas(bb, st[n0:self.seguidor.n], n0)
+        if self.seguidor.sonoridad is not None and self.seguidor.n // 10 > n0 // 10:
+            self._avanzar_sonoridad()
         for i in range(n0, self.seguidor.n):
             if (i + 1) % 10 == 0:  # un punto por segundo para el gráfico
                 t, v = (i + 1) / 10, float(st[i])
                 self.curva_t.agregar([t])
                 self.curva_st.agregar([v])
                 self.curva_pend.append((t, v))
+
+    def _avanzar_sonoridad(self):
+        """La sonoridad de cada segundo que se completa (~15 ms): así, al cerrar una canción ya está
+        calculada. Un fallo aquí no puede afectar a la grabación: se avisa y se deja de calcular."""
+        try:
+            self.seguidor.sonoridad.hasta(self.seguidor.n // 10)
+        except Exception as ex:
+            log.warning("Dejé de calcular la sonoridad percibida: %s", ex)
+            self.seguidor.sonoridad = None
+
+    def _leer_espectro(self, a, b):
+        """Filas [a, b) de espectro.f32, para el espectro de cada canción al cerrarla."""
+        if self.f_espectro is None:
+            return np.zeros((0, N_BANDAS), dtype=np.float32)
+        self.f_espectro.flush()
+        return capa.leer_espectro(self.carpeta, a, b)
+
+    def _seguir_bandas(self, bb, st, n0):
+        """Lo que muestra la ventana: las bandas de los últimos 3 s y el espectro de la canción en curso
+        (solo para mirar: el de cada canción queda en la canción, medido al cerrarla)."""
+        if self.f_espectro is None:
+            return
+        for fila in bb:
+            self.esp_ultimas.append(fila)
+        p = self.seguidor.pista_actual()
+        ini = int(round(p["inicio_s"] * 10)) if p else None
+        if ini != self.esp_cancion[0]:
+            self.esp_cancion = [ini, np.zeros(N_BANDAS), 0]
+        if ini is None:
+            return
+        idx = np.arange(n0, n0 + len(bb))
+        m = (idx >= ini) & (np.asarray(st, dtype=float) > -60.0)
+        if m.any():
+            self.esp_cancion[1] = self.esp_cancion[1] + bb[m].sum(axis=0)
+            self.esp_cancion[2] += int(m.sum())
+
+    def _frecuencias(self):
+        if self.f_espectro is None or not self.esp_ultimas:
+            return None
+        out = {"bandas_3s": [float(v) for v in np.mean(self.esp_ultimas, axis=0)]}
+        if self.esp_cancion[2] >= 10 and not self.pausado:
+            e = self.esp_cancion[1] / self.esp_cancion[2]
+            out["cancion"] = espectro_cancion(np.tile(e, (1, 1)), [0.0], sr=self.sr)
+        son = self.seguidor.sonoridad
+        if son is not None and not self.pausado:
+            try:
+                n = son.ahora(self.seguidor.n)
+                if not np.isnan(n):
+                    out["n_ahora"], out["ln_ahora"] = n, float(zwicker.sone_a_phon(n))
+                p = self.seguidor.pista_actual()
+                if p:
+                    c = son.cancion(int(round(p["inicio_s"] * 10)), self.seguidor.n, self.seguidor.st.v)
+                    if c:
+                        out["cancion_son"] = c
+            except Exception as ex:
+                log.warning("Dejé de calcular la sonoridad percibida: %s", ex)
+                self.seguidor.sonoridad = None
+        return out
 
     def _procesar_eventos(self):
         while True:
@@ -867,7 +961,7 @@ class Motor:
             b = int(e.get("frame_global") or 0) // self.blk
             self.seguidor.evento(e, b)
             ev = e.get("evento")
-            if ev in ("pausa", "reanuda"):
+            if ev in ("pausa", "reanuda", "alerta"):
                 continue
             if ev == "sin_sesion":
                 self.estado_app = ""
@@ -883,6 +977,36 @@ class Motor:
                 else:
                     log.info("La app pasó a: %s", self.estado_app)
 
+    def _condiciones(self, cfg):
+        """Las condiciones del servicio como campos (S2), más los textos de antes para quien los lea."""
+        activa = cfg.get("normalizacion_activa", True)
+        nivel = cfg.get("nivel_normalizacion") or "Normal"
+        crossfade = float(cfg.get("crossfade_s") or 0.0)
+        captura = (cfg.get("captura_ajustes") or "").strip()
+        if captura and os.path.isfile(captura):   # la captura de los ajustes queda dentro de la sesión
+            destino = "captura_ajustes" + os.path.splitext(captura)[1].lower()
+            try:
+                if not os.path.exists(os.path.join(self.carpeta, destino)):
+                    shutil.copy2(captura, os.path.join(self.carpeta, destino))
+                captura = destino
+            except OSError as e:
+                log.warning("No pude copiar la captura de los ajustes (%s).", e)
+        return {"servicio": servicio_de(cfg.get("fuente")), "fuente": cfg.get("fuente", ""),
+                "playlist": cfg.get("playlist", ""), "normalizacion_activa": activa, "nivel_normalizacion": nivel,
+                "crossfade_s": crossfade, "automix": cfg.get("automix", ""),
+                "volumen_app_pct": cfg.get("volumen_app_pct"), "calidad": cfg.get("calidad", ""),
+                "orden": cfg.get("orden", ""), "captura_ajustes": captura,
+                "normalizacion": normalizacion_de(activa, nivel), "crossfade": f"{crossfade:g} s"}
+
+    def _publicar_alertas_estado(self):
+        """Las alertas de cambio de estado (S5): aviso en rojo y registro, y una fila «alerta» en pistas.csv."""
+        nombres = {"nivel": "cambio de nivel", "transiciones": "cambio en los cortes entre canciones"}
+        for a in self.seguidor.alertas_nuevas:
+            self._alerta(nombres.get(a["codigo"], a["codigo"]), a["activa"], a["texto"])
+            if a["activa"]:
+                self.meta.marcar("alerta", self.escritor.posicion(), {"estado": a["texto"]})
+        self.seguidor.alertas_nuevas = []
+
     def _publicar_pistas(self):
         for p in self.seguidor.nuevas:
             self.publicador.enviar({"tipo": "pista", "pista": p})
@@ -895,6 +1019,13 @@ class Motor:
 
     def _guardar_picos(self):
         """Un fallo al guardar un recorte no debe afectar a la grabación: solo se avisa."""
+        if self.seguidor.cambios_nuevos:
+            # ΔI y salto de cuerpo de un recorte se conocen cuando termina la canción nueva
+            try:
+                self.picos.completar(self.seguidor.cambios_nuevos)
+            except Exception as ex:
+                log.warning("No pude completar picos.csv: %s", ex)
+            self.seguidor.cambios_nuevos = []
         for e in self.seguidor.saltos_notorios:
             try:
                 fila = self.picos.guardar(e, self._reloj_de)
@@ -981,6 +1112,8 @@ class Motor:
         # a disco cada segundo: si el motor muere, se pierde a lo más eso (y se vuelve a medir del audio)
         self.f_bloques.flush()
         self.f_reloj.flush()
+        if self.f_espectro is not None:
+            self.f_espectro.flush()
         if time.time() - self.ult_latido >= LATIDO_S:
             self._latido()
         falla = self.cfg.get("_fallar_tras_s")   # (solo pruebas) un error a mitad de la grabación
@@ -1053,6 +1186,7 @@ class Motor:
                 "monitor_dispositivo": self.monitor.nombre,
             },
             "alertas": list(self.alertas.values()),
+            "frecuencias": self._frecuencias(),
         }
 
     def _snapshot(self):
@@ -1096,6 +1230,7 @@ class Motor:
         if final:
             self.seguidor.terminar()
             self._publicar_pistas()
+            self._publicar_alertas_estado()
             self._guardar_picos()
         self.meta.detener.set()
         self.meta.join(timeout=3)
@@ -1103,6 +1238,9 @@ class Motor:
         self.escritor.cerrar()
         self.f_reloj.close()
         self.f_bloques.close()
+        if self.f_espectro is not None:
+            self.f_espectro.close()
+            self.f_espectro = None
         self.stats = self.seguidor.estadisticas()
         sistema.impedir_suspension(False)
         self.terminado = True

@@ -148,9 +148,12 @@ class MedidorBloques:
 
     Un bloque se entrega recién cuando su true peak está completo, lo que exige unas pocas
     muestras posteriores (el retardo del filtro); el último bloque sale al llamar a terminar().
+
+    Con bandas=True entrega además la energía por tercio de octava de cada bloque (bandas.BancoTercios,
+    29 columnas) como cuarto arreglo, para los mismos bloques y al mismo tiempo que los demás.
     """
 
-    def __init__(self, sr, canales, true_peak=True):
+    def __init__(self, sr, canales, true_peak=True, bandas=False):
         self.sr = sr
         self.canales = canales
         self.blk = sr // 10
@@ -164,6 +167,11 @@ class MedidorBloques:
         self.tp_buf = np.zeros(0)                    # true peak por muestra, ya alineado
         self.tp_ini = 0                              # muestra global a la que corresponde tp_buf[0]
         self._saltar = self.tp.retardo if self.tp is not None else 0
+        self.banco = None
+        if bandas:
+            from .bandas import N_BANDAS, BancoTercios
+            self.banco = BancoTercios(sr, canales)
+            self.pend_b = np.zeros((0, N_BANDAS))    # bandas de los bloques que esperan su true peak
 
     def procesar(self, x):
         """x: (n, canales). Devuelve (z_por_canal (nb, canales), sample_peak (nb,), true_peak (nb,))."""
@@ -177,6 +185,8 @@ class MedidorBloques:
             y, self.zi = sosfilt(self.sos, xb, axis=0, zi=self.zi)
             self.pend_z = np.vstack([self.pend_z, (y.reshape(nb, self.blk, -1) ** 2).mean(axis=1)])
             self.pend_sp = np.concatenate([self.pend_sp, np.abs(xb).reshape(nb, self.blk, -1).max(axis=(1, 2))])
+            if self.banco is not None:
+                self.pend_b = np.vstack([self.pend_b, self.banco.procesar(xb)])
         if self.tp is not None and len(x):
             self._alimentar_tp(np.asarray(x, dtype=np.float64))
         return self._entregar()
@@ -210,8 +220,12 @@ class MedidorBloques:
                 self.tp_buf = self.tp_buf[fin:]
                 self.tp_ini += fin
         if not listos:
-            return np.zeros((0, self.canales)), np.zeros(0), np.zeros(0)
+            vacio = (np.zeros((0, self.canales)), np.zeros(0), np.zeros(0))
+            return vacio + (np.zeros((0, self.pend_b.shape[1])),) if self.banco is not None else vacio
         zc, sp = self.pend_z[:listos], self.pend_sp[:listos]
         self.pend_z, self.pend_sp = self.pend_z[listos:], self.pend_sp[listos:]
         self.bloque_pend += listos
+        if self.banco is not None:
+            b, self.pend_b = self.pend_b[:listos], self.pend_b[listos:]
+            return zc, sp, tp, b
         return zc, sp, tp

@@ -11,6 +11,7 @@ import math
 
 import numpy as np
 
+from . import estudio
 from .bs1770 import SILENCIO, db, integrado, lra, lufs, refinar_corte
 
 NAN = float("nan")
@@ -60,9 +61,15 @@ def _f(x):
 
 class Seguidor:
     """Recibe bloques de 100 ms (energía, picos) y avisos de cambio de canción; mantiene las
-    canciones cerradas, los cambios entre ellas y la canción en curso."""
+    canciones cerradas, los cambios entre ellas y la canción en curso.
 
-    def __init__(self, min_dur=30.0, refinar_s=3.0, umbral_salto=3.0):
+    Las estadísticas siguen las definiciones del estudio (estudio.py): solo cuentan las canciones
+    válidas (no cortas, no parciales, fuera de los tramos excluidos). `tramos`: [{desde_s, hasta_s,
+    motivo}] en segundos de audio. `nivel_aplica`: la alerta de cambio de nivel (no aplica a una radio,
+    que no normaliza)."""
+
+    def __init__(self, min_dur=30.0, refinar_s=3.0, umbral_salto=3.0, tramos=None, nivel_aplica=True,
+                 marcar_inciertos=True, bandas_de=None, sr=48000, sonoridad=None):
         self.min_dur = min_dur
         self.ventana = int(round(refinar_s * 10))
         self.umbral = umbral_salto
@@ -81,6 +88,16 @@ class Seguidor:
         self.min_bloques = max(100, math.ceil(min_dur * 10))
         self.piso = 0              # bloque de la última pausa: el ajuste de un corte no puede pasar de ahí
         self.tras_pausa = False    # la próxima canción empieza al reanudar: llega empezada, no desde su inicio
+        self.tramos = list(tramos or [])
+        self.terminada = False     # la última canción solo es parcial cuando la sesión termina
+        self.marcar_inciertos = marcar_inciertos
+        self.alerta = estudio.AlertaEstado(nivel_aplica)
+        self.alertas_nuevas = []   # alertas de cambio de estado que aún no se informan (ver AlertaEstado)
+        self._ic = (None, None)    # intervalos de confianza: (clave de lo que se usó, valores)
+        self.bandas_de = bandas_de  # (a, b) → filas de bandas de esos bloques (espectro.f32), si la sesión las tiene
+        self.sonoridad = sonoridad  # sonoridad.Sonoridad de la sesión (desde espectro.f32), si la tiene
+        self.cambios_nuevos = []    # cambios medidos que aún no se informan (para completar picos.csv)
+        self.sr = sr
 
     @property
     def n(self):
@@ -117,6 +134,8 @@ class Seguidor:
             if self.pendiente is not None:
                 self._resolver_pendiente()
             self._cortar(b, None, False)
+            if self.cerradas:     # la canción que se cortó acá (o la última antes) se va empezada: parcial
+                self.cerradas[-1]["seguida_de_pausa"] = True
             self.ultima = None
             self.piso = b
             self.tras_pausa = True
@@ -137,6 +156,7 @@ class Seguidor:
         if self.pendiente is not None:
             self._resolver_pendiente()
         self._cortar(self.n, None, False)
+        self.terminada = True
 
     # ------------------------------------------------------------------ cortes
     def _resolver_pendiente(self):
@@ -145,7 +165,10 @@ class Seguidor:
             b, movido = refinar_corte(self.mom.v, p["b"], self.ventana, desde=self.piso)
         else:
             b, movido = p["b"], False
-        self._cortar(b, p["e"], movido, p.get("tras_pausa", False))
+        # Con una radio web, si el ajuste fino no encontró un hueco, el corte quedó donde llegó el título
+        # (más el ajuste de la fuente): puede estar corrido unos segundos.
+        incierto = self.marcar_inciertos and not movido and (p["e"].get("app") or "").startswith("radio:")
+        self._cortar(b, p["e"], movido, p.get("tras_pausa", False), incierto)
 
     def _revisar_salto(self):
         """Calcula el salto de la canción en curso con la anterior apenas cumple la duración mínima y,
@@ -156,6 +179,8 @@ class Seguidor:
         if a is None or a.get("salto_revisado") or self.n - a["ini"] < self.min_bloques:
             return
         a["salto_revisado"] = True
+        if a.get("corte_incierto"):    # con el corte incierto, el recorte no mostraría el cambio real
+            return
         prev = self.ultima
         if prev is None or prev["corta"] or a["ini"] / 10 - (prev["inicio_s"] + prev["duracion_s"]) > 1:
             return
@@ -168,7 +193,7 @@ class Seguidor:
                 "corte_ajustado": a["corte_ajustado"],
             })
 
-    def _cortar(self, b, e, movido, tras_pausa=False):
+    def _cortar(self, b, e, movido, tras_pausa=False, incierto=False):
         if self.actual is not None and b > self.actual["ini"]:
             self._cerrar(self.actual, b)
         if e is None:
@@ -176,7 +201,7 @@ class Seguidor:
         else:
             self.actual = {"ini": b, "artista": e.get("artista") or "", "titulo": e.get("titulo") or "",
                            "album": e.get("album") or "", "app": e.get("app") or "",
-                           "corte_ajustado": movido, "tras_pausa": tras_pausa}
+                           "corte_ajustado": movido, "tras_pausa": tras_pausa, "corte_incierto": incierto}
 
     def _cerrar(self, pista, fin):
         a, b = pista["ini"], fin
@@ -192,27 +217,49 @@ class Seguidor:
             "primeros_10s": integrado(z, a, min(b, a + 100)),
             "ultimos_10s": integrado(z, max(a, b - 100), b),
             "corta": dur < self.min_dur, "salto": NAN,
+            "corte_incierto": pista.get("corte_incierto", False), "seguida_de_pausa": False,
         }
+        p.update(estudio.medir_cancion(p, self.st.v, self.mom.v))
+        if self.bandas_de is not None and b > a:
+            from .bandas import espectro_cancion
+            esp = espectro_cancion(self.bandas_de(a, b), self.st.v[a:b], sr=self.sr)
+            if esp:
+                p.update(esp)
+        if self.sonoridad is not None and b > a:
+            son = self.sonoridad.cancion(a, b, self.st.v)
+            if son:
+                p.update(son)
         prev = self.ultima
-        if self._contiguas(prev, p):
-            salto = p["primeros_10s"] - prev["ultimos_10s"]
-            p["salto"] = salto
-            if not math.isnan(salto):
-                self.transiciones.append({
-                    "t_s": p["inicio_s"], "salto": salto, "salto_integrado": p["lufs"] - prev["lufs"],
-                    "de": f"{prev['artista']} - {prev['titulo']}", "a": f"{p['artista']} - {p['titulo']}",
-                })
+        i = len(self.cerradas)
+        # por ahora válida: lo que se sabe al cerrarla (si después viene una pausa, pasa a parcial)
+        p["por_ahora_valida"] = not (p["corta"] or i == 0 or p["tras_pausa"] or math.isnan(p["lufs"])
+                                     or estudio.excluida(p["inicio_s"], p["inicio_s"] + dur, self.tramos))
+        t = estudio.medir_cambio(prev, p, self.st.v) if prev is not None else None
+        if t is not None:
+            # (mismas condiciones que analizar.py: ninguna corta y no más de 1 s entre ellas)
+            p["salto"] = t["salto_borde"]
+            p["delta_i"] = t["delta_i"]
+            p["salto_cuerpo"] = t["salto_cuerpo"]
+            # el arranque y el silencio dependen de dónde cae el corte: no en un corte incierto
+            p["subida_arranque"] = NAN if t["incierto"] else t["subida_arranque"]
+            p["silencio_previo_s"] = NAN if t["incierto"] else t["silencio_s"]
+            t.update(salto=t["salto_borde"], salto_integrado=t["delta_i"], i_de=i - 1, i_a=i)
+            self.transiciones.append(t)
+            self.cambios_nuevos.append(t)
         self.cerradas.append(p)
         self.nuevas.append(p)
         self.ultima = p
+        if p["por_ahora_valida"]:
+            self._alertas(self.alerta.cancion(p), p)
+            if t is not None and prev.get("por_ahora_valida") and not prev.get("seguida_de_pausa"):
+                self._alertas(self.alerta.cambio(prev, p, self.mom.v), p)
         return p
 
-    @staticmethod
-    def _contiguas(prev, p):
-        """Mismas condiciones que analizar.py para contar un cambio de canción: ninguna de las dos
-        es corta y no hubo una pausa de más de 1 s entre ellas."""
-        return (prev is not None and not prev["corta"] and not p["corta"]
-                and p["inicio_s"] - (prev["inicio_s"] + prev["duracion_s"]) <= 1)
+    def _alertas(self, eventos, p):
+        for e in eventos:
+            e["b"] = p["a"]
+            e["t_s"] = p["inicio_s"]
+            self.alertas_nuevas.append(e)
 
     # ------------------------------------------------------------------ consultas
     def momentary(self):
@@ -246,13 +293,27 @@ class Seguidor:
             d["salto"] = integrado(z, a, a + 100) - prev["ultimos_10s"]
         return d
 
-    def estadisticas(self):
-        li = np.array([p["lufs"] for p in self.cerradas if not p["corta"]], dtype=float)
-        li = li[~np.isnan(li)]
-        sal = np.abs(np.array([t["salto"] for t in self.transiciones], dtype=float))
+    def estadisticas(self, intervalos=True):
+        """Promedios de la sesión con las definiciones del estudio: solo canciones válidas y cambios
+        entre canciones válidas. Los saltos en el borde y el silencio no cuentan los cortes inciertos."""
+        P = estudio.marcar(self.cerradas, self.tramos, self.terminada)
+        T = estudio.marcar_cambios(self.transiciones, P)
+        V = [p for p in P if p["valida"]]
+        li, med = estudio.niveles(P)
+        TV = [t for t in T if t["valida"]]
+        seguros = [t for t in TV if not t.get("incierto")]
+        sal = np.abs(estudio.limpio([t["salto_borde"] for t in seguros]))
+        dI = estudio.limpio([t["delta_i"] for t in TV])
+        gap = estudio.limpio([t["silencio_s"] for t in seguros])
         horas = self.bloques_musica / 36000
-        med = float(np.median(li)) if len(li) else NAN
         sobre = int((sal > self.umbral).sum())
+        unicas = len({estudio.clave(p) for p in V})
+        clave_ic = (len(li), round(med, 9) if len(li) else None, len(dI),
+                    sum(1 for p in V if p.get("lufs_percibido") is not None))
+        if intervalos and self._ic[0] != clave_ic:
+            self._ic = (clave_ic, estudio.intervalos(P, T))
+        bloques_excl = sum(max(0, min(self.n, int(t["hasta_s"] * 10)) - max(0, int(t["desde_s"] * 10)))
+                           for t in self.tramos)
         return {
             "canciones": int(len(li)),
             "media": float(li.mean()) if len(li) else NAN,
@@ -261,6 +322,13 @@ class Seguidor:
             "min": float(li.min()) if len(li) else NAN,
             "max": float(li.max()) if len(li) else NAN,
             "pct_2lu": float(np.mean(np.abs(li - med) <= 2) * 100) if len(li) else NAN,
+            "pct_05": estudio.pct(np.abs(li - med) <= 0.5) if len(li) else NAN,
+            "pct_1": estudio.pct(np.abs(li - med) <= 1) if len(li) else NAN,
+            "unicas": unicas,
+            "repetidas": int(len(li)) - unicas,
+            "parciales": sum(1 for p in P if p["parcial"] and not p["corta"]),
+            "excluidas": sum(1 for p in P if p["excluida"] and not p["corta"]),
+            "cortas": sum(1 for p in P if p["corta"]),
             "transiciones": int(len(sal)),
             "salto_medio": float(sal.mean()) if len(sal) else NAN,
             "salto_p95": float(np.percentile(sal, 95)) if len(sal) else NAN,
@@ -268,6 +336,15 @@ class Seguidor:
             "sobre_umbral": sobre,
             "umbral": self.umbral,
             "por_hora": sobre / horas if horas >= 0.05 else NAN,
+            "cambios": int(len(dI)),
+            "pct_dI_1": estudio.pct(np.abs(dI) > 1) if len(dI) else NAN,
+            "inciertos": sum(1 for t in TV if t.get("incierto")),
+            "silencio_mediana_s": float(np.median(gap)) if len(gap) else NAN,
+            "pct_tp_0": estudio.pct(np.array([p["tp"] for p in V]) > 0) if V else NAN,
+            "ic": dict(self._ic[1]) if self._ic[1] else None,
             "horas_musica": horas,
+            "horas_validas": (self.n - bloques_excl) / 36000,
             "tp_max": float(db(self.tp_max)) if self.n else NAN,
+            **estudio.metricas_cambios(V, TV, med),
+            **estudio.metricas_sonoridad(V),
         }

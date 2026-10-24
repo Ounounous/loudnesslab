@@ -6,3 +6,6 @@ dist/
 grabaciones/
 comparacion/
 *.wav
+
+# el plan del estudio y sus datos (resultados, sesiones y títulos): quedan en el equipo, no en el repositorio
+docs/

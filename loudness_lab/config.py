@@ -15,6 +15,39 @@ APP_POR_FUENTE = {
     "Otra": "",
 }
 
+# Servicio que se mide, según la fuente (S2 del plan v0.2)
+SERVICIO_POR_FUENTE = {"Soundtrack": "Soundtrack", "Spotify": "Spotify", "Mystify (radio web)": "Mystify"}
+
+# Normalización del servicio: lo que se elige → (activa, nivel). «Sin niveles»: el servicio la tiene pero
+# no ofrece elegir nivel (Soundtrack). «No aplica»: una radio, que no normaliza por canción.
+NORMALIZACIONES = {
+    "Activada · Normal": (True, "Normal"),
+    "Activada · Silencioso": (True, "Silencioso"),
+    "Activada · Fuerte": (True, "Fuerte"),
+    "Activada (sin niveles)": (True, "Sin niveles"),
+    "Desactivada": (False, "No aplica"),
+    "No aplica": (None, "No aplica"),
+}
+# Lo habitual de cada fuente (se puede cambiar): normalización, automix, crossfade
+CONDICIONES_POR_FUENTE = {
+    "Spotify": ("Activada · Normal", "Sí", 0.0),
+    "Soundtrack": ("Activada (sin niveles)", "No aplica", 0.0),
+    "Mystify (radio web)": ("No aplica", "No aplica", 0.0),
+}
+
+
+def servicio_de(fuente):
+    return SERVICIO_POR_FUENTE.get(fuente or "", "Otro")
+
+
+def normalizacion_de(activa, nivel):
+    """El texto de NORMALIZACIONES que corresponde a (activa, nivel)."""
+    for texto, par in NORMALIZACIONES.items():
+        if par == (activa, nivel):
+            return texto
+    return "Activada · Normal" if activa else "Desactivada"
+
+
 # Radios web que no publican el título en Windows: se lee de su stream (ver radio.py). `ajuste_s`: cuánto
 # después del título suele estar el borde real entre canciones en esa radio; el ajuste fino de ±3 s busca
 # el hueco alrededor de ese punto, como con cualquier otra fuente.
@@ -31,9 +64,17 @@ class Config:
     # condiciones del experimento (quedan en sesion.json)
     fuente: str = "Spotify"
     playlist: str = ""
-    normalizacion: str = ""
-    crossfade: str = ""
+    normalizacion: str = ""        # (texto, sesiones anteriores a v0.2; ahora se deriva de los campos de abajo)
+    crossfade: str = ""            # (texto, ídem)
     calidad: str = ""
+    # condiciones del servicio como campos (S2 del plan v0.2)
+    normalizacion_activa: object = True     # True | False | None (no aplica)
+    nivel_normalizacion: str = "Normal"     # Silencioso | Normal | Fuerte | Sin niveles | No aplica
+    crossfade_s: float = 0.0
+    automix: str = "Sí"                     # Sí | No | No aplica
+    volumen_app_pct: float = 100.0          # volumen de la app o de la zona
+    orden: str = "Fijo"                     # Fijo | Aleatorio
+    captura_ajustes: str = ""               # imagen con los ajustes del servicio (se copia a la sesión)
     notas: str = ""
     etiqueta: str = ""
     # captura
@@ -50,6 +91,7 @@ class Config:
     umbral_salto: float = 3.0
     alerta_silencio_min: float = 2.0
     min_dur: float = 30.0
+    nivel_escucha_db_spl: float = 65.0   # sonoridad percibida: una señal a −14 LUFS suena a esto en la mesa
     checklist: dict = field(default_factory=dict)
     # la sesión con la que se abre la app (carpeta); no es parte de lo que se graba
     ultima_sesion: str = ""

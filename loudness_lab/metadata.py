@@ -140,10 +140,11 @@ class HiloMetadata(threading.Thread):
         self.errores = 0
         self.marcas = queue.Queue()
 
-    def marcar(self, evento, posicion):
-        """Pide anotar «pausa» o «reanuda» en la posición dada (la del momento de la orden: el hilo
-        la escribe unas décimas después, cuando el audio ya pudo avanzar)."""
-        self.marcas.put((evento, ahora_iso(), posicion))
+    def marcar(self, evento, posicion, info=None):
+        """Pide anotar «pausa», «reanuda» o «alerta» en la posición dada (la del momento de la orden: el
+        hilo la escribe unas décimas después, cuando el audio ya pudo avanzar). `info`: más columnas
+        (la alerta lleva su texto en «estado»)."""
+        self.marcas.put((evento, ahora_iso(), posicion, info or {}))
 
     def _registrar(self, w, f, evento, info, posicion=None, hora=None):
         fg, arch, fa = posicion or self.obtener_posicion()
@@ -172,10 +173,16 @@ class HiloMetadata(threading.Thread):
                 # Las marcas van primero: lo que se lea después ya es posterior a ellas.
                 while True:
                     try:
-                        evento, hora, pos = self.marcas.get_nowait()
+                        evento, hora, pos, info = self.marcas.get_nowait()
                     except queue.Empty:
                         break
-                    self._registrar(w, f, evento, {}, pos, hora)
+                    if evento not in ("pausa", "reanuda"):     # una alerta: solo queda anotada
+                        fg, arch, fa = pos
+                        w.writerow({"hora_pc": hora, "frame_global": fg, "archivo": arch, "frame_en_archivo": fa,
+                                    "evento": evento, **info})
+                        f.flush()
+                        continue
+                    self._registrar(w, f, evento, info, pos, hora)
                     en_pausa = evento == "pausa"
                     if not en_pausa:
                         ultimo = "inicio"   # al reanudar se vuelve a anotar qué canción suena
@@ -218,8 +225,8 @@ class HiloSimulado(threading.Thread):
         self.detener = threading.Event()
         self.marcas = queue.Queue()
 
-    def marcar(self, evento, posicion):
-        self.marcas.put((evento, ahora_iso(), posicion))
+    def marcar(self, evento, posicion, info=None):
+        self.marcas.put((evento, ahora_iso(), posicion, info or {}))
 
     def run(self):
         leidas = 0
@@ -231,11 +238,13 @@ class HiloSimulado(threading.Thread):
                 w.writeheader()
             while not self.detener.is_set():
                 while not self.marcas.empty():
-                    evento, hora, (fg, arch, fpos) = self.marcas.get_nowait()
+                    evento, hora, (fg, arch, fpos), info = self.marcas.get_nowait()
                     fila = {"hora_pc": hora, "frame_global": fg, "archivo": arch, "frame_en_archivo": fpos,
-                            "evento": evento}
+                            "evento": evento, **info}
                     w.writerow(fila)
                     f.flush()
+                    if evento not in ("pausa", "reanuda"):
+                        continue
                     en_pausa = evento == "pausa"
                     if self.al_evento:
                         self.al_evento(fila)

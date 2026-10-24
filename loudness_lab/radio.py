@@ -325,8 +325,8 @@ class HiloRadio(threading.Thread):
         self.ult_api = 0.0
 
     # lo que llama el motor
-    def marcar(self, evento, posicion):
-        self.marcas.put((evento, ahora_iso(), posicion))
+    def marcar(self, evento, posicion, info=None):
+        self.marcas.put((evento, ahora_iso(), posicion, info or {}))
 
     def alimentar(self, inicio, bloque):
         self.captura.alimentar(inicio, bloque)
@@ -456,14 +456,16 @@ class HiloRadio(threading.Thread):
             while not self.detener.is_set():
                 while True:   # las marcas van primero, como en HiloMetadata
                     try:
-                        evento, hora, pos = self.marcas.get_nowait()
+                        evento, hora, pos, info = self.marcas.get_nowait()
                     except queue.Empty:
                         break
                     fg, arch, fa = pos
                     fila = {"hora_pc": hora, "frame_global": fg, "archivo": arch, "frame_en_archivo": fa,
-                            "evento": evento}
+                            "evento": evento, **info}
                     w.writerow(fila)
                     f.flush()
+                    if evento not in ("pausa", "reanuda"):     # una alerta: solo queda anotada
+                        continue
                     if self.al_evento:
                         self.al_evento(fila)
                     self.en_pausa = evento == "pausa"

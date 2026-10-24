@@ -13,7 +13,8 @@ a = Analysis(
     ["LoudnessLab.py"],
     pathex=["."],
     binaries=[],
-    datas=[],
+    # la licencia del algoritmo de sonoridad copiado de MoSQITo (loudness_lab/zwicker.py, Apache 2.0)
+    datas=[("loudness_lab/LICENCIA_MOSQITO.txt", "loudness_lab")],
     hiddenimports=ocultos,
     excludes=["matplotlib", "tkinter", "IPython", "pyqtgraph.opengl", "pyqtgraph.examples",
               "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineQuick",

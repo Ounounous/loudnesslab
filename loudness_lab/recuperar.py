@@ -24,6 +24,7 @@ import struct
 
 import numpy as np
 
+from .bandas import N_BANDAS
 from .bs1770 import MedidorBloques
 
 CALENTAR_BLOQUES = 20   # 2 s de audio previo para que el filtro K y el true peak lleguen con su estado
@@ -186,20 +187,32 @@ def preparar(carpeta, sr, canales, archivos_previos=()):
     bloques = total // blk
     if total % blk:
         informe.append("quedó un resto de audio sin completar un bloque")
-    # 3. mediciones: filas completas, ni más ni menos que los bloques de audio
+    # 3. mediciones (y espectro, si la sesión lo tiene): filas completas, ni más ni menos que los
+    #    bloques de audio; las que falten se vuelven a medir desde el audio
     ruta_m = os.path.join(carpeta, "mediciones.f32")
     fila = (canales + 2) * 4
     largo = os.path.getsize(ruta_m) if os.path.exists(ruta_m) else 0
-    filas = largo // fila
-    if filas > bloques:
-        filas = bloques
+    filas = min(largo // fila, bloques)
     with open(ruta_m, "ab") as f:
         f.truncate(filas * fila)
-    if filas < bloques:
-        z, sp, tp = remedir(carpeta, archivos, sr, canales, filas, bloques)
-        with open(ruta_m, "ab") as f:
-            f.write(np.column_stack([z, sp, tp]).astype(np.float32).tobytes())
-        informe.append(f"se volvieron a medir {bloques - filas} bloques ({(bloques - filas) / 10:.1f} s) desde el audio")
+    ruta_e = os.path.join(carpeta, "espectro.f32")
+    fila_e = N_BANDAS * 4
+    filas_e = None
+    if os.path.exists(ruta_e):
+        filas_e = min(os.path.getsize(ruta_e) // fila_e, bloques)
+        with open(ruta_e, "ab") as f:
+            f.truncate(filas_e * fila_e)
+    desde = min(filas, filas_e if filas_e is not None else filas)
+    if desde < bloques:
+        z, sp, tp, bb = remedir(carpeta, archivos, sr, canales, desde, bloques, bandas=True)
+        if filas < bloques:
+            with open(ruta_m, "ab") as f:
+                f.write(np.column_stack([z, sp, tp])[filas - desde:].astype(np.float32).tobytes())
+            informe.append(f"se volvieron a medir {bloques - filas} bloques ({(bloques - filas) / 10:.1f} s) desde el audio")
+        if filas_e is not None and filas_e < bloques:
+            with open(ruta_e, "ab") as f:
+                f.write(bb[filas_e - desde:].astype(np.float32).tobytes())
+            informe.append(f"se volvieron a medir las bandas de {bloques - filas_e} bloques")
     # 4. CSV y registro sin líneas a medias
     for nombre in ("pistas.csv", "reloj.csv", "picos.csv"):
         cerrar_linea(os.path.join(carpeta, nombre))
@@ -207,27 +220,25 @@ def preparar(carpeta, sr, canales, archivos_previos=()):
     return archivos, total, bloques, informe
 
 
-def remedir(carpeta, archivos, sr, canales, desde, hasta):
-    """Las mediciones de los bloques [desde, hasta), calculadas desde el audio en disco. El medidor
-    parte CALENTAR_BLOQUES antes para llegar con el estado que tenía en vivo."""
+def remedir(carpeta, archivos, sr, canales, desde, hasta, bandas=False):
+    """Las mediciones de los bloques [desde, hasta), calculadas desde el audio en disco: (z, sp, tp) y,
+    con bandas, también las bandas. El medidor parte CALENTAR_BLOQUES antes para llegar con el estado
+    que tenía en vivo."""
     blk = sr // 10
     ini = max(0, desde - CALENTAR_BLOQUES)
     audio = leer_audio(carpeta, archivos, ini * blk, hasta * blk)
-    m = MedidorBloques(sr, canales)
+    m = MedidorBloques(sr, canales, bandas=bandas)
     partes = [m.procesar(audio), m.terminar()]
-    z = np.concatenate([p[0] for p in partes])[desde - ini:hasta - ini]
-    sp = np.concatenate([p[1] for p in partes])[desde - ini:hasta - ini]
-    tp = np.concatenate([p[2] for p in partes])[desde - ini:hasta - ini]
-    return z, sp, tp
+    return tuple(np.concatenate([p[k] for p in partes])[desde - ini:hasta - ini] for k in range(len(partes[0])))
 
 
-def medidor_calentado(carpeta, archivos, sr, canales, bloques):
+def medidor_calentado(carpeta, archivos, sr, canales, bloques, bandas=False):
     """Un medidor para seguir midiendo desde el bloque `bloques`, con el estado que habría tenido si
     el audio hubiera seguido de corrido (como lo ve analizar.py, que mide todos los WAV seguidos).
     Devuelve (medidor, filas que va a entregar y hay que descartar porque ya están medidas)."""
     blk = sr // 10
     ini = max(0, bloques - CALENTAR_BLOQUES)
-    m = MedidorBloques(sr, canales)
+    m = MedidorBloques(sr, canales, bandas=bandas)
     if bloques > ini:
         listos = len(m.procesar(leer_audio(carpeta, archivos, ini * blk, bloques * blk))[1])
         return m, (bloques - ini) - listos

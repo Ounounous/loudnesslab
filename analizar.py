@@ -13,6 +13,9 @@ Uso:
     python analizar.py grabaciones/soundtrack_* grabaciones/spotify_*      (analiza y compara)
 
 Salidas en <sesion>/analisis/ y, si hay más de una sesión, en ./comparacion/
+
+Una sesión archivada (sin WAV) se analiza desde mediciones.f32, los bloques que midió el motor en vivo y
+que se verificaron contra el audio antes de borrarlo. --desde-mediciones lo fuerza aunque haya audio.
 """
 
 import argparse
@@ -30,18 +33,33 @@ import soundfile as sf
 # implementación, para que los números en vivo y los del informe no diverjan.
 from loudness_lab.bs1770 import (SILENCIO, MedidorBloques, db, integrado, lra, lufs,  # noqa: F401
                                  media_movil, refinar_corte)
+from loudness_lab import estudio
 from loudness_lab.sesiones import cortes_de, pausas_de
 
 
 # ----------------------------------------------------------------------------
 # Paso 1: recorrer el audio y obtener energía K-ponderada y peaks cada 100 ms
 # ----------------------------------------------------------------------------
-def medir_bloques(carpeta, sesion, true_peak=True):
+def medir_desde_mediciones(carpeta, sesion):
+    """Los mismos bloques, leídos de mediciones.f32 (energía K por canal, sample peak, true peak)."""
+    ruta = os.path.join(carpeta, "mediciones.f32")
+    if not os.path.exists(ruta):
+        raise SystemExit(f"No hay audio (audio_*.wav) ni mediciones.f32 en {carpeta}")
+    sr, ch = int(sesion.get("sample_rate") or 48000), int(sesion.get("canales") or 2)
+    datos = np.fromfile(ruta, dtype=np.float32)
+    n = len(datos) // (ch + 2)
+    d = datos[:n * (ch + 2)].reshape(n, ch + 2).astype(np.float64)
+    nota = "audio archivado" if sesion.get("audio_archivado") else "sin leer el audio"
+    print(f"  desde mediciones.f32 ({nota}): {n / 36000:.2f} h", flush=True)
+    return sr, d[:, :ch].sum(axis=1), d[:, ch], d[:, ch + 1], []
+
+
+def medir_bloques(carpeta, sesion, true_peak=True, desde_mediciones=False):
     archivos = [a["archivo"] for a in sesion.get("archivos", [])]
-    if not archivos:
+    if not archivos or not all(os.path.exists(os.path.join(carpeta, a)) for a in archivos):
         archivos = sorted(os.path.basename(p) for p in glob.glob(os.path.join(carpeta, "audio_*.wav")))
-    if not archivos:
-        raise SystemExit(f"No hay archivos audio_*.wav en {carpeta}")
+    if desde_mediciones or not archivos:
+        return medir_desde_mediciones(carpeta, sesion)
 
     sr = sf.info(os.path.join(carpeta, archivos[0])).samplerate
     medidor = None
@@ -149,7 +167,8 @@ def analizar_sesion(carpeta, args):
             sesion = json.load(f)
     etiqueta = sesion.get("etiqueta") or os.path.basename(os.path.normpath(carpeta))
     print(f"\n=== {etiqueta} ===")
-    sr, z, sp, tp, archivos = medir_bloques(carpeta, sesion, true_peak=not args.sin_true_peak)
+    sr, z, sp, tp, archivos = medir_bloques(carpeta, sesion, true_peak=not args.sin_true_peak,
+                                            desde_mediciones=args.desde_mediciones)
     n = len(z)
     mom = lufs(media_movil(z, 4))
     st = lufs(media_movil(z, 30))
@@ -203,6 +222,9 @@ def analizar_sesion(carpeta, args):
             "corte_ajustado": s["corte_ajustado"], "pista_corta": dur < args.min_dur,
             "tras_pausa": s["tras_pausa"],
         }
+        # cuerpo, cola y cabeza (las definiciones del estudio, loudness_lab/estudio.py)
+        m = estudio.medir_cancion(p, st, mom)
+        p.update(cuerpo_lufs=m["cuerpo"], cola_s=m["cola_s"], cabeza_s=m["cabeza_s"])
         pistas.append(p)
 
     transiciones = []
@@ -211,11 +233,14 @@ def analizar_sesion(carpeta, args):
             continue   # (una canción que llega tras una pausa de la grabación no sigue a la anterior)
         if p2["inicio_s"] - (p1["inicio_s"] + p1["duracion_s"]) > 1:
             continue  # hubo una pausa entre medio
+        c = estudio.medir_cambio(_para_estudio(p1, st, mom), _para_estudio(p2, st, mom), st) or {}
         transiciones.append({
             "t": p2["inicio"], "t_s": p2["inicio_s"],
             "de": f"{p1['artista']} - {p1['titulo']}", "a": f"{p2['artista']} - {p2['titulo']}",
             "salto_10s_lu": p2["lufs_primeros_10s"] - p1["lufs_ultimos_10s"],
             "salto_integrado_lu": p2["lufs_integrado"] - p1["lufs_integrado"],
+            "salto_cuerpo_lu": c.get("salto_cuerpo", np.nan), "subida_arranque_lu": c.get("subida_arranque", np.nan),
+            "silencio_s": c.get("silencio_s", np.nan),
         })
 
     escribir_csv(os.path.join(salida, "pistas_metricas.csv"), pistas)
@@ -259,6 +284,7 @@ def analizar_sesion(carpeta, args):
         "salto_transicion_abs_lu": stats(np.abs(sal)),
         "transiciones_sobre_3lu": int((np.abs(sal) > 3).sum()),
         "transiciones_sobre_5lu": int((np.abs(sal) > 5).sum()),
+        **_metricas_cambios(transiciones),
     }
     with open(os.path.join(salida, "resumen.json"), "w", encoding="utf-8") as f:
         json.dump(resumen, f, indent=2, ensure_ascii=False, default=float)
@@ -271,6 +297,28 @@ def analizar_sesion(carpeta, args):
     if not args.sin_graficos:
         graficos(salida, etiqueta, t, st, pistas, transiciones, li)
     return resumen, li, sal
+
+
+def _para_estudio(p, st, mom):
+    """Una canción de este script con los nombres de campos de loudness_lab/estudio.py."""
+    return {**p, "corta": p["pista_corta"], "lufs": p["lufs_integrado"], "primeros_10s": p["lufs_primeros_10s"],
+            "ultimos_10s": p["lufs_ultimos_10s"], **estudio.medir_cancion(p, st, mom)}
+
+
+def _metricas_cambios(transiciones):
+    """% de cambios con |ΔI| > 3 LU, salto de cuerpo > 3 LU, subida de arranque > 5 LU y silencio > 2 s
+    (definiciones del estudio, sin sus reglas de canciones parciales)."""
+    def v(k):
+        x = np.array([t[k] for t in transiciones], dtype=float)
+        return x[~np.isnan(x)]
+    dI, sc, sa, gap = v("salto_integrado_lu"), v("salto_cuerpo_lu"), v("subida_arranque_lu"), v("silencio_s")
+    pct = estudio.pct
+    return {"pct_dI_3": pct(np.abs(dI) > 3) if len(dI) else np.nan,
+            "pct_cuerpo_3": pct(np.abs(sc) > 3) if len(sc) else np.nan,
+            "pct_arranque_5": pct(sa > 5) if len(sa) else np.nan,
+            "p95_arranque_lu": float(np.percentile(sa, 95)) if len(sa) else np.nan,
+            "silencio_mediana_s": float(np.median(gap)) if len(gap) else np.nan,
+            "pct_silencio_2s": pct(gap > 2) if len(gap) else np.nan}
 
 
 def escribir_csv(ruta, filas):
@@ -317,6 +365,9 @@ def resumen_texto(r, transiciones):
         f"TRANSICIONES ({r['transiciones']}) - salto entre últimos 10 s y primeros 10 s",
         f"  |salto| medio {g(S, 'media')} LU, p95 {g(S, 'p95')} LU, máx {g(S, 'max')} LU",
         f"  Saltos > 3 LU: {r['transiciones_sobre_3lu']}   > 5 LU: {r['transiciones_sobre_5lu']}",
+        f"  |ΔI| > 3 LU: {g(r, 'pct_dI_3')}%   salto de cuerpo > 3 LU: {g(r, 'pct_cuerpo_3')}%   "
+        f"subida de arranque > 5 LU: {g(r, 'pct_arranque_5')}% (p95 {g(r, 'p95_arranque_lu')} LU)",
+        f"  Silencio entre canciones: mediana {g(r, 'silencio_mediana_s')} s, > 2 s: {g(r, 'pct_silencio_2s')}%",
     ]
     peores = sorted([x for x in transiciones if not np.isnan(x["salto_10s_lu"])],
                     key=lambda x: -abs(x["salto_10s_lu"]))[:10]
@@ -460,6 +511,8 @@ def main():
     ap.add_argument("--umbral-etiqueta", type=float, default=3.0, help="LU para marcar saltos en Audacity")
     ap.add_argument("--sin-true-peak", action="store_true", help="más rápido; usa sample peak")
     ap.add_argument("--sin-graficos", action="store_true")
+    ap.add_argument("--desde-mediciones", action="store_true",
+                    help="no leer el audio: usar mediciones.f32 (automático si la sesión no tiene WAV)")
     ap.add_argument("--comparacion", default="comparacion", help="carpeta para la comparación")
     args = ap.parse_args()
 

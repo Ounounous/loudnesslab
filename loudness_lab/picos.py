@@ -17,7 +17,8 @@ from .sistema import limpiar_nombre
 SEG_ANTES = 10     # de la canción que terminó
 SEG_DESPUES = 10   # de la que empezó
 CAMPOS = ["n", "archivo", "hora_pc", "corte_s", "salto_lu", "lufs_ultimos_10s_anterior",
-          "lufs_primeros_10s_siguiente", "de", "a", "corte_en_recorte_s", "corte_ajustado"]
+          "lufs_primeros_10s_siguiente", "de", "a", "corte_en_recorte_s", "corte_ajustado",
+          "delta_i_lu", "salto_cuerpo_lu"]     # (estas dos, cuando termina la canción nueva: ver completar)
 
 
 class Retrovisor:
@@ -74,6 +75,40 @@ class GuardaPicos:
     def alimentar(self, inicio, x):
         self.retrovisor.agregar(inicio, x)
 
+    def _leer(self):
+        try:
+            with open(self.indice, encoding="utf-8", newline="") as f:
+                r = csv.DictReader(f)
+                return list(r), list(r.fieldnames or [])
+        except OSError:
+            return [], []
+
+    def _reescribir(self, filas):
+        tmp = self.indice + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CAMPOS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(filas)
+        os.replace(tmp, self.indice)
+
+    def completar(self, cambios):
+        """Agrega ΔI y salto de cuerpo a los recortes de estos cambios (Seguidor.cambios_nuevos), si los
+        hay: se conocen recién cuando la canción nueva termina, bastante después de guardar el recorte."""
+        filas, _ = self._leer()
+        if not filas:
+            return 0
+        por_corte = {round(float(r["corte_s"]), 1): r for r in filas if r.get("corte_s")}
+        hechos = 0
+        for t in cambios:
+            r = por_corte.get(round(float(t["t_s"]), 1))
+            if r is not None:
+                r["delta_i_lu"] = "" if t["delta_i"] != t["delta_i"] else round(float(t["delta_i"]), 2)
+                r["salto_cuerpo_lu"] = "" if t["salto_cuerpo"] != t["salto_cuerpo"] else round(float(t["salto_cuerpo"]), 2)
+                hechos += 1
+        if hechos:
+            self._reescribir(filas)
+        return hechos
+
     def guardar(self, e, reloj):
         """Guarda el recorte de un salto notorio (ver Seguidor._revisar_salto). `reloj(frame)` da la
         hora (epoch) de un frame del audio. Devuelve lo que escribió en picos.csv, o None si el audio
@@ -103,6 +138,10 @@ class GuardaPicos:
                 "lufs_primeros_10s_siguiente": round(e["primeros_10s"], 2), "de": e["de"], "a": e["a"],
                 "corte_en_recorte_s": round((corte - ini) / self.sr, 3), "corte_ajustado": e["corte_ajustado"]}
         nuevo = not os.path.exists(self.indice)
+        if not nuevo:
+            filas, campos = self._leer()
+            if campos != CAMPOS:      # un picos.csv de antes de v0.2: se le agregan las columnas nuevas
+                self._reescribir(filas)
         with open(self.indice, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=CAMPOS)
             if nuevo:

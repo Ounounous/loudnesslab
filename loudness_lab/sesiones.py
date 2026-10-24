@@ -79,7 +79,11 @@ def listar(base):
             estado = "terminada"
         else:
             estado = "cortada: se retoma sola" if es_abierta(carpeta) else "interrumpida"
+        est = estudio_de(s)
         out.append({"nombre": s.get("etiqueta") or n, "carpeta": carpeta, "inicio": s.get("inicio_pc") or "",
+                    "estudio": " · ".join(x for x in (est.get("servicio"), est.get("playlist"),
+                                                     {"valida": "válida", "parcial": "parcial",
+                                                      "no_valida": "no válida"}.get(est.get("estado"), "")) if x),
                     "inicio_epoch": _epoch(s.get("inicio_pc")) or os.path.getmtime(carpeta),
                     "horas": float(s.get("segundos_totales") or 0) / 3600,
                     "canciones": int((s.get("resumen_en_vivo") or {}).get("canciones") or 0),
@@ -198,13 +202,120 @@ def _log(carpeta, maximo=500):
             for l in lineas]
 
 
-def repasar(carpeta, s, cfg):
+def estudio_de(s):
+    """Lo que el estudio dice de una sesión (sesion.json → «estudio»): servicio, lista, estado, tramos
+    excluidos y notas. Vacío si todavía no se cargó."""
+    e = s.get("estudio")
+    return dict(e) if isinstance(e, dict) else {}
+
+
+ESTADOS_ESTUDIO = ("valida", "parcial", "no_valida")
+
+
+def _escribir_sesion(carpeta, s):
+    ruta = os.path.join(carpeta, "sesion.json")
+    tmp = ruta + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(s, f, indent=2, ensure_ascii=False, default=float)
+    os.replace(tmp, ruta)
+
+
+def editable(carpeta):
+    """Se pueden corregir los datos del estudio de una sesión que no está grabando ni abierta (cortada)."""
+    vivo = protocolo.motor_vivo()
+    return not (es_abierta(carpeta) or (vivo and _misma_carpeta(vivo.get("carpeta", ""), carpeta)))
+
+
+def guardar_estudio(carpeta, nuevo, motivo=""):
+    """Guarda en sesion.json lo que el estudio dice de la sesión (servicio, lista, estado, tramos
+    excluidos, notas) y deja registro de cada cambio en `ediciones`. Si cambia la lista, también se
+    corrige en las condiciones de la sesión. Devuelve los campos que cambiaron."""
+    if not editable(carpeta):
+        raise RuntimeError("La sesión está grabando (o quedó abierta): sus datos se corrigen cuando termine.")
+    s = _json(os.path.join(carpeta, "sesion.json"))
+    if s is None:
+        raise ValueError(f"«{carpeta}» no es una sesión: falta sesion.json.")
+    antes = estudio_de(s)
+    if not antes:   # primera vez: lo que la sesión ya decía
+        cond = s.get("condiciones") or {}
+        antes = {"servicio": cond.get("servicio", ""), "playlist": cond.get("playlist", ""), "estado": "",
+                 "tramos_excluidos": [], "notas": ""}
+    despues = {**antes, **nuevo}
+    despues["tramos_excluidos"] = sorted(
+        ({"desde_s": float(t["desde_s"]), "hasta_s": float(t["hasta_s"]), "motivo": t.get("motivo", "")}
+         for t in despues.get("tramos_excluidos") or [] if float(t["hasta_s"]) > float(t["desde_s"])),
+        key=lambda t: t["desde_s"])
+    if despues.get("estado") and despues["estado"] not in ESTADOS_ESTUDIO:
+        raise ValueError(f"Estado no válido: {despues['estado']}")
+    hora = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    cambios = [k for k in despues if despues.get(k) != antes.get(k)]
+    if not cambios and isinstance(s.get("estudio"), dict):
+        return []
+    s["estudio"] = despues
+    if "playlist" in cambios:
+        for clave in ("condiciones", "config"):
+            if isinstance(s.get(clave), dict):
+                s[clave]["playlist"] = despues["playlist"]
+    s.setdefault("ediciones", []).extend(
+        {"campo": f"estudio.{k}", "antes": antes.get(k), "despues": despues[k], "hora": hora,
+         **({"motivo": motivo} if motivo else {})} for k in cambios)
+    _escribir_sesion(carpeta, s)
+    return cambios
+
+
+def importar_catalogo(base, catalogo, sobrescribir=False):
+    """Carga en cada sesión de `base` lo que dice el catálogo del estudio (catalogo_sesiones.json).
+    No toca las que ya tienen datos del estudio (salvo `sobrescribir`) ni las que están grabando.
+    Devuelve [(sesión, resultado)]."""
+    out = []
+    for nombre, info in (catalogo.get("sesiones") or {}).items():
+        carpeta = os.path.join(base, nombre)
+        s = _json(os.path.join(carpeta, "sesion.json"))
+        if s is None:
+            out.append((nombre, "no está en esta carpeta"))
+            continue
+        if estudio_de(s) and not sobrescribir:
+            out.append((nombre, "ya tenía datos del estudio: no se tocó"))
+            continue
+        if not editable(carpeta):
+            out.append((nombre, "está grabando: no se tocó"))
+            continue
+        nuevo = {"servicio": info.get("servicio", ""), "playlist": info.get("playlist", ""),
+                 "estado": info.get("estado", ""), "tramos_excluidos": info.get("tramos_excluidos", []),
+                 "notas": info.get("nota", "")}
+        cambios = guardar_estudio(carpeta, nuevo, motivo="catálogo del estudio")
+        out.append((nombre, f"cargado ({', '.join(cambios)})" if cambios else "sin cambios"))
+    return out
+
+
+def nivel_aplica(cfg):
+    """La alerta de cambio de nivel solo tiene sentido con la normalización activa: sin ella (o en una
+    radio, que no normaliza por canción) las canciones varían de por sí y daría falsas alarmas."""
+    return (cfg.get("nivel_normalizacion") or "") != "No aplica" and cfg.get("normalizacion_activa") is not False \
+        and not (cfg.get("stream_url") or "").strip()
+
+
+def repasar(carpeta, s, cfg, tramos=None, **opciones):
     """Pasa mediciones.f32 y pistas.csv por un Seguidor nuevo, en el orden en que ocurrieron: queda
-    como estaba el de la grabación en ese punto. Devuelve (seguidor, eventos, bloques)."""
+    como estaba el de la grabación en ese punto. `tramos`: los excluidos (por defecto, los del estudio
+    de la sesión). Devuelve (seguidor, eventos, bloques)."""
     sr, ch = int(s.get("sample_rate") or 48000), int(s.get("canales") or 2)
     blk = sr // 10
+    if tramos is None:
+        tramos = estudio_de(s).get("tramos_excluidos") or []
+    from . import capa
+    n_med = (os.path.getsize(os.path.join(carpeta, "mediciones.f32")) // ((ch + 2) * 4)
+             if os.path.exists(os.path.join(carpeta, "mediciones.f32")) else 0)
+    bandas_de = son = None
+    if n_med and capa.filas_espectro(carpeta) >= n_med:   # con la capa de frecuencias completa
+        bandas_de = lambda a, b: capa.leer_espectro(carpeta, a, b)  # noqa: E731
+        from . import sonoridad
+        nivel, campo = sonoridad.de_sesion(s, cfg)
+        # toda la sesión de una vez (por lotes es ~50 veces más rápido que canción por canción)
+        son = sonoridad.Sonoridad(bandas_de, nivel, campo).hasta(n_med // 10)
     seg = Seguidor(min_dur=float(cfg.get("min_dur") or 30), refinar_s=3.0,
-                   umbral_salto=float(cfg.get("umbral_salto") or 3.0))
+                   umbral_salto=float(cfg.get("umbral_salto") or 3.0), tramos=tramos,
+                   nivel_aplica=nivel_aplica(cfg), bandas_de=bandas_de, sr=sr, sonoridad=son, **opciones)
     try:
         datos = np.fromfile(os.path.join(carpeta, "mediciones.f32"), dtype=np.float32)
     except OSError:

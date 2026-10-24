@@ -2,7 +2,8 @@
 
 Sin argumentos abre la ventana. Con --motor corre el motor de grabación (la ventana lo lanza
 así, en un proceso aparte). Con --asegurar corre el guardián, que retoma una sesión abierta cuyo
-motor no está corriendo (lo usa la tarea programada de Windows).
+motor no está corriendo (lo usa la tarea programada de Windows). Con --capa verifica una sesión
+contra su audio y genera su capa de frecuencias.
 """
 
 import faulthandler
@@ -26,6 +27,9 @@ def _registrar_caidas():
 
 def main():
     _archivo_caidas = _registrar_caidas()  # noqa: F841  (debe quedar abierto mientras corre)
+    if "--capa" in sys.argv:       # verificar sesiones y generar su capa de frecuencias (en segundo plano)
+        from loudness_lab.capa import main as capa
+        return capa(sys.argv[1:])
     if "--asegurar" in sys.argv:   # el guardián (tarea programada de Windows)
         from loudness_lab.guardian import main as guardian
         return guardian()
