@@ -346,6 +346,7 @@ class Seguidor:
             "horas_musica": horas,
             "horas_validas": (self.n - bloques_excl) / 36000,
             "tp_max": float(db(self.tp_max)) if self.n else NAN,
+            "techo_cadena": estudio.techo_cadena(self.sp.v, P),
             **estudio.metricas_cambios(V, TV, med),
             **estudio.metricas_sonoridad(V),
             "nivel_escucha_db_spl": self.sonoridad.nivel if self.sonoridad is not None else NAN,

@@ -57,6 +57,10 @@ LATIDO_S = 5.0          # cada cuánto se anota en latido.json hasta dónde lleg
 log = logging.getLogger("loudness")
 
 
+class ApagadoWindows(Exception):
+    """Windows se apaga, se reinicia o cierra la sesión: el motor cierra limpio y la sesión queda abierta."""
+
+
 def ahora_iso():
     return dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
 
@@ -445,6 +449,15 @@ class Motor:
         self.pausa_desde = None
         self.pausa_total = 0.0     # segundos pausados, sin contar la pausa en curso
         self.pausas = []
+        # Avisos de Windows (sistema.VigiaWindows): apagado, suspensión y vuelta
+        self.vigia = None
+        self.apagando = threading.Event()      # Windows se apaga: el bucle cierra limpio
+        self.cerrado_ok = threading.Event()    # y avisa que terminó, para dejar seguir a Windows
+        self._t_suspension = self._t_despertar = None
+        # Tramos sin música (más de alerta_silencio_min), con su causa: van a sesion.json y pueden pasar a
+        # tramos excluidos del estudio
+        self.sin_musica = list((self.previa or {}).get("tramos_sin_musica") or [])
+        self._sin_musica_actual = None
 
     def _en_pausa_s(self):
         return time.time() - self.pausa_desde if self.pausado else 0.0
@@ -604,6 +617,7 @@ class Motor:
         if self.previa is not None and self.estado_deseado == "pausada":
             self._pausar()      # se cortó estando en pausa: sigue en pausa
         self._escribir_abierta()   # desde aquí, si el motor muere, el próximo retoma esta sesión
+        self._iniciar_vigia()
 
         if not sistema.impedir_suspension(True):
             log.warning("No pude impedir que el PC se suspenda: revisa la configuración de energía.")
@@ -613,6 +627,12 @@ class Motor:
                  self.libre_gb, self.libre_gb / self.gb_hora, cfg.get("app") or "cualquiera")
         try:
             self._bucle()
+        except ApagadoWindows:
+            try:
+                self._cerrar(final=False, error="Windows se está apagando, reiniciando o cerrando la sesión")
+            finally:
+                self.cerrado_ok.set()
+            return
         except BaseException as e:
             # Un error no termina la sesión: se cierra lo que se pueda y queda abierta para retomarla.
             try:
@@ -817,6 +837,9 @@ class Motor:
         ult_min = time.time()
         self._cada_minuto(primera=True)
         while not self.detener.is_set():
+            if self.apagando.is_set():
+                raise ApagadoWindows()
+            self._revisar_suspension()
             datos = self._sacar_audio(0.1)
             ahora = time.time()
             if datos:
@@ -843,6 +866,47 @@ class Motor:
             if horas > 0 and self.escritor.frame_global / self.sr >= horas * 3600:   # horas de audio grabado
                 self.motivo_fin = "se cumplió la duración configurada"
                 break
+
+    # ------------------------------------------------------------------ avisos de Windows
+    def _iniciar_vigia(self):
+        """Apagado: Windows muestra «Loudness Lab está grabando…» y, si igual se apaga, el motor cierra limpio
+        con la hora exacta del corte. Suspensión: queda anotada como un corte. Si no se puede, se graba igual."""
+        try:
+            self.vigia = sistema.VigiaWindows(
+                motivo=lambda: (f"Loudness Lab está grabando «{self.etiqueta}». Si apagas, la grabación se corta "
+                                "aquí y se retoma sola al volver a iniciar sesión."),
+                al_apagar=self._al_apagar, al_suspender=self._al_suspender, al_despertar=self._al_despertar,
+                bloquear=lambda: not self.terminado)
+            if not self.vigia.iniciar():
+                raise RuntimeError("no se creó la ventana oculta")
+        except Exception as e:
+            self.vigia = None
+            log.warning("No pude recibir los avisos de apagado y suspensión de Windows (%s): se graba igual.", e)
+
+    def _al_apagar(self):
+        """(En el hilo de la vigía.) Pide al bucle que cierre y espera a que termine, con un límite."""
+        self.apagando.set()
+        self.cerrado_ok.wait(8)
+
+    def _al_suspender(self):
+        self._t_suspension = time.time()
+
+    def _al_despertar(self):
+        self._t_despertar = time.time()
+
+    def _revisar_suspension(self):
+        """Al volver de una suspensión, el tramo dormido se anota como un corte (como un reinicio): queda con su
+        hora de inicio y fin, cierra la canción que sonaba y no hay salto a través de él."""
+        if self._t_despertar is None:
+            return
+        desde, self._t_suspension, self._t_despertar = self._t_suspension, None, None
+        if desde is None or self.pausado or self.terminado:
+            return
+        self.corte_pendiente = {"muerte": desde, "motivo": "suspensión de Windows", "cerrar_pausa": False}
+        self._escribir_corte()
+        self.publicador.enviar({"tipo": "pausas", "pausas": self._pausas_gui()})
+        self._latido()
+        self.ult_dato = time.time()     # (la captura puede tardar en volver: se reabre si no llega audio)
 
     def _sacar_audio(self, timeout):
         try:
@@ -1130,10 +1194,14 @@ class Motor:
         if self.pausado:   # en pausa no hay audio que vigilar
             for codigo in ("silencio", "ruta", "metadata"):
                 self._alerta(codigo, False, "")
+            self._seguir_sin_musica(False)
             return
         sil = self.seguidor.silencio_bloques / 10
         lim = float(self.cfg.get("alerta_silencio_min") or 2) * 60
-        self._alerta("silencio", s > 5 and sil >= lim, f"Sin música hace {sil / 60:.0f} min.")
+        sin = s > 5 and sil >= lim
+        self._seguir_sin_musica(sin)
+        causa = self._sin_musica_actual["causa"] if self._sin_musica_actual else ""
+        self._alerta("silencio", sin, f"Sin música hace {sil / 60:.0f} min: {causa}.")
         self._alerta("ruta", self.estado_app == "reproduciendo" and sil >= 10,
                      f"La app dice que está reproduciendo, pero no llega audio a {self.nombre_dispositivo}. "
                      "Revisa que su salida sea ese dispositivo (Sistema > Sonido > Mezclador de volumen).")
@@ -1144,6 +1212,40 @@ class Motor:
         self._alerta("metadata", self.radio is None and bool(app) and self.sin_meta_desde is not None
                      and time.time() - self.sin_meta_desde > 30,
                      f"No encuentro '{app}' en el panel multimedia de Windows: no se están registrando las canciones.")
+
+    def _causa_sin_musica(self):
+        """Por qué no llega música, con lo que se sabe de la fuente."""
+        if self.radio is not None and self.radio.aviso:
+            return "sin conexión con el stream de la radio"
+        app = self.cfg.get("app") or "la app de música"
+        if self.estado_app == "pausado":
+            return f"{app} está en pausa"
+        if self.estado_app in ("detenido", "cerrado"):
+            return f"{app} está detenida"
+        if self.radio is None and self.sin_meta_desde is not None:
+            return f"{app} no está abierta (o no publica qué suena)"
+        if self.estado_app == "reproduciendo":
+            return f"{app} dice que reproduce, pero no llega audio: ¿sin internet, o su salida no es el cable?"
+        return "la fuente está en silencio"
+
+    def _seguir_sin_musica(self, activo):
+        """Un tramo sin música empieza cuando salta la alerta de silencio (con su causa y una notificación de
+        Windows, aunque la ventana esté cerrada) y termina cuando vuelve la música o se pausa la grabación."""
+        actual = self._sin_musica_actual
+        if activo and actual is None:
+            desde = max(0.0, (self.seguidor.n - self.seguidor.silencio_bloques) / 10)
+            causa = self._causa_sin_musica()
+            self._sin_musica_actual = {"desde_s": round(desde, 1), "hasta_s": None, "causa": causa,
+                                       "hora_desde": iso_de(self._reloj_de(int(desde * self.sr))), "hora_hasta": None}
+            self.sin_musica.append(self._sin_musica_actual)
+            minutos = self.seguidor.silencio_bloques / 600
+            sistema.notificar("Loudness Lab: sin música",
+                              f"«{self.etiqueta}» lleva {minutos:.0f} min sin música: {causa}. La grabación sigue.")
+        elif not activo and actual is not None:
+            hasta = self.seguidor.n / 10
+            actual.update(hasta_s=round(hasta, 1), hora_hasta=ahora_iso())
+            log.info("Volvió la música tras %s sin música (%s).", hms_txt(hasta - actual["desde_s"]), actual["causa"])
+            self._sin_musica_actual = None
 
     def _cada_minuto(self, primera=False):
         fg = self.escritor.frame_global
@@ -1202,6 +1304,7 @@ class Motor:
         s = dict(self.sesion, archivos=self.escritor.archivos, frames_totales=self.escritor.frame_global,
                  segundos_totales=self.escritor.frame_global / self.sr, overflows=self.overflows,
                  reaperturas=self.reaperturas, resumen_en_vivo=self.stats, pausas=self.pausas,
+                 techo_cadena=(self.stats or {}).get("techo_cadena"), tramos_sin_musica=self.sin_musica,
                  segundos_en_pausa=self._segundos_pausados() - self._segundos_cortes(),
                  cortes=self.cortes, segundos_en_cortes=self._segundos_cortes())
         if fin:
@@ -1245,11 +1348,18 @@ class Motor:
             self.f_espectro = None
         self.stats = self.seguidor.estadisticas()
         sistema.impedir_suspension(False)
+        if self._sin_musica_actual is not None:     # el tramo sin música termina donde termina lo grabado
+            self._sin_musica_actual.update(hasta_s=round(self.seguidor.n / 10, 1), hora_hasta=ahora_iso())
+            self._sin_musica_actual = None
         self.terminado = True
         if not final:
             self._guardar_sesion()
             self._latido(error=error)
-            log.error("El motor se detuvo por un error (%s). La sesión sigue abierta: se retomará sola.", error)
+            if error.startswith("Windows"):
+                log.warning("%s: la grabación se corta aquí (%s) y se retoma sola al volver a iniciar sesión.",
+                            error, dt.datetime.now().strftime("%H:%M:%S"))
+            else:
+                log.error("El motor se detuvo por un error (%s). La sesión sigue abierta: se retomará sola.", error)
             self.publicador.cerrar()     # sin «fin»: la ventana lo toma como un corte y la retoma
             try:
                 self.listener.close()

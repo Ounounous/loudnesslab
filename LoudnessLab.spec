@@ -33,4 +33,16 @@ exe = EXE(
     icon="icono.ico",
     upx=False,
 )
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="LoudnessLab")
+# El motor de grabación, con nombre propio para distinguirlo de la ventana en el Administrador de tareas
+# (es el mismo programa: la ventana lo lanza con --motor). Comparte todo lo demás de la carpeta.
+exe_motor = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="LoudnessLab-motor",
+    console=False,
+    icon="icono.ico",
+    upx=False,
+)
+coll = COLLECT(exe, exe_motor, a.binaries, a.datas, strip=False, upx=False, name="LoudnessLab")

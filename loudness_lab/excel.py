@@ -12,7 +12,7 @@ import time
 import numpy as np
 import xlsxwriter
 
-from . import bandas
+from . import bandas, estudio
 from .bs1770 import SILENCIO
 
 HOJAS = ("Últimas canciones", "Promedios de la sesión", "Data LUFS", "Registro", "Espectro por canción")
@@ -111,6 +111,7 @@ def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
         pico = libro.add_format({"font_color": "#c0392b", "bold": True})
 
         umbral = float(stats.get("umbral") or 3.0) if stats else 3.0
+        techo = ((stats or {}).get("techo_cadena") or {}).get("dbfs")
 
         # ---- hoja 1: canciones (las mismas columnas de la tabla, de la primera a la última)
         h1 = libro.add_worksheet(HOJAS[0])
@@ -144,6 +145,8 @@ def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
                     else "")
             if p.get("corte_incierto"):
                 nota = (nota + " · " if nota else "") + "corte incierto"
+            if estudio.en_techo(p, techo):
+                nota = (nota + " · " if nota else "") + "pico en el techo de la cadena: true peak ≥ 0"
             if nota:
                 h1.write_string(i, 13, nota, f_gris)
             for c, k in ((14, "artista"), (15, "titulo"), (16, "album")):
@@ -209,6 +212,9 @@ def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
             ("Saltos en el borde sobre el umbral, por hora", s.get("por_hora"), "por hora", f_1),
             ("Canciones con true peak > 0 dBTP", s.get("pct_tp_0"), "%", f_1),
             ("True peak máximo", s.get("tp_max"), "dBTP", f_1),
+            ("Techo de la cadena (los picos no pasan de aquí)", techo, "dBFS", f_2),
+            ("Canciones con su pico en el techo (true peak ≥ 0)", ((s.get("techo_cadena") or {}).get("canciones")
+                                                                   if techo is not None else None), "", f_0),
             ("Horas con música", s.get("horas_musica"), "h", f_2),
             ("Horas fuera de tramos excluidos", s.get("horas_validas"), "h", f_2),
             None,

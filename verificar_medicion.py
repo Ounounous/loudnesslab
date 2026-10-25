@@ -11,8 +11,13 @@ Además comprueba dos cosas propias de esta herramienta:
 Y, si hay ffmpeg, compara contra su filtro ebur128 (un medidor independiente) con los programas
 auténticos del set y con los WAV que se pasen en --comparar (por ejemplo, una sesión grabada).
 
+También verifica la capa de frecuencias y la sonoridad percibida (plan v0.2, S6 y S7) con señales de
+prueba que no necesitan el set: ruido rosa y tonos por el banco de tercios de octava, ISO 532-1 (un tono
+de 1 kHz a 40 dB SPL es 1 sone, por definición) y la calibración a dB SPL.
+
 Uso:
     python verificar_medicion.py CARPETA_CON_EL_SET [--comparar a.wav b.wav] [--salida informe.txt]
+    python verificar_medicion.py --solo-frecuencias
 """
 
 import argparse
@@ -253,9 +258,53 @@ def contra_ffmpeg(rutas, inf):
 
 
 # ----------------------------------------------------------------------------
+def pruebas_frecuencias(inf):
+    """La capa de frecuencias (bandas.py) y la sonoridad percibida (zwicker.py, sonoridad.py)."""
+    from loudness_lab import bandas, sonoridad, zwicker
+    sr = 48000
+    x = bandas.ruido_rosa(sr * 30, sr)
+    e = bandas.BancoTercios(sr, 1).procesar(x[:, None])[20:].mean(axis=0)
+    nivel = 10 * np.log10(e)
+    nom = np.array(bandas.NOMINALES)
+    sel = (nom >= 31.5) & (nom <= 12500)
+    inf.numero("frec", "Ruido rosa: nivel de cada tercio respecto de la media (31,5 Hz–12,5 kHz)",
+               nivel[sel] - nivel[sel].mean(), 0.0, 0.5, 0.5)
+    t = np.arange(sr * 5) / sr
+    e1 = bandas.BancoTercios(sr, 1).procesar(np.sin(2 * np.pi * 1000 * t)[:, None])[10:].mean(axis=0)
+    i = bandas.NOMINALES.index(1000)
+    inf.numero("frec", "Tono 1 kHz: % de la energía en la banda de 1 kHz", 100 * e1[i] / e1.sum(), 97.5, 2.5, 2.5)
+    xs = np.stack([x, x[::-1]], 1)[:sr * 6]
+    a = bandas.BancoTercios(sr, 2).procesar(xs)
+    b = bandas.BancoTercios(sr, 2)
+    rng = np.random.default_rng(3)
+    partes, pos = [], 0
+    while pos < len(xs):
+        k = int(rng.integers(1, 20000))
+        partes.append(b.procesar(xs[pos:pos + k]))
+        pos += k
+    igual = np.allclose(a, np.vstack(partes), rtol=1e-12, atol=1e-18)
+    inf.filas.append(("frec", "Bandas: trozos de cualquier tamaño == una pasada", "sí" if igual else "no", "sí", igual, ""))
+    m = MedidorBloques(sr, 2, true_peak=False, bandas=True)
+    m.procesar(xs[:sr * 3])
+    m.procesar(np.zeros((sr * 10, 2)))
+    limpio = all(np.all((z == 0) | (np.abs(z) >= 1e-30)) for z in [m.zi] + list(m.banco.zi))
+    inf.filas.append(("frec", "Silencio digital: filtros sin números desnormales", "sí" if limpio else "no", "sí", limpio,
+                      ""))
+    e2 = bandas.BancoTercios(sr, 1).procesar((np.sqrt(2) * np.sin(2 * np.pi * 1000 * t))[:, None])[10:].mean(axis=0)
+    c = 40 - 10 * np.log10(e2[i])
+    n = float(zwicker.sonoridad(10 * np.log10(e2) + c)[0])
+    inf.numero("532-1", "Tono 1 kHz a 40 dB SPL: sonoridad (sone)", n, 1.0, 0.05, 0.05)
+    inf.numero("532-1", "Calibración: ruido rosa a −14 LUFS = 65 dB SPL → C (dB)", sonoridad.calibracion_spl(), 79.89,
+               0.01, 0.01)
+    ln = float(zwicker.sone_a_phon(zwicker.sonoridad(np.full(29, 65 - 10 * np.log10(29)))[0]))
+    inf.numero("532-1", "Ruido rosa a −14 LUFS: LUFS percibido", sonoridad.lufs_percibido(ln), -14.0, 0.05, 0.05)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Verifica la medición contra el EBU loudness test set.")
-    ap.add_argument("carpeta", help="carpeta con los WAV del EBU loudness test set (ya descomprimido)")
+    ap.add_argument("carpeta", nargs="?", help="carpeta con los WAV del EBU loudness test set (ya descomprimido)")
+    ap.add_argument("--solo-frecuencias", action="store_true",
+                    help="solo la capa de frecuencias y la sonoridad (no necesitan el set)")
     ap.add_argument("--comparar", nargs="*", default=[], help="WAV propios para comparar con ffmpeg")
     ap.add_argument("--sin-ffmpeg", action="store_true")
     ap.add_argument("--salida", help="guarda además el informe en este archivo")
@@ -265,21 +314,27 @@ def main():
     except Exception:
         pass
 
-    med, inf = Medidas(args.carpeta), Informe()
-    pruebas_ebu(med, inf)
+    inf = Informe()
+    if not args.solo_frecuencias:
+        if not args.carpeta:
+            ap.error("falta la carpeta con el EBU loudness test set (o --solo-frecuencias)")
+        med = Medidas(args.carpeta)
+        pruebas_ebu(med, inf)
+        mal_trozos = [a for a, t, v in med.consistencia if not t]
+        mal_vivo = [a for a, t, v in med.consistencia if not v]
+        n = len(med.consistencia)
+        inf.filas.append(("propio", f"Trozos de cualquier tamaño == una pasada ({n} archivos)",
+                          f"{n - len(mal_trozos)}/{n}", f"{n}/{n}", not mal_trozos, ", ".join(mal_trozos)))
+        inf.filas.append(("propio", f"Medidor en vivo == análisis ({n} archivos)", f"{n - len(mal_vivo)}/{n}",
+                          f"{n}/{n}", not mal_vivo, ", ".join(mal_vivo)))
+    pruebas_frecuencias(inf)
 
-    mal_trozos = [a for a, t, v in med.consistencia if not t]
-    mal_vivo = [a for a, t, v in med.consistencia if not v]
-    n = len(med.consistencia)
-    inf.filas.append(("propio", f"Trozos de cualquier tamaño == una pasada ({n} archivos)", f"{n - len(mal_trozos)}/{n}",
-                      f"{n}/{n}", not mal_trozos, ", ".join(mal_trozos)))
-    inf.filas.append(("propio", f"Medidor en vivo == análisis ({n} archivos)", f"{n - len(mal_vivo)}/{n}",
-                      f"{n}/{n}", not mal_vivo, ", ".join(mal_vivo)))
-
-    if not args.sin_ffmpeg and shutil.which("ffmpeg"):
+    if args.solo_frecuencias or args.sin_ffmpeg:
+        pass
+    elif shutil.which("ffmpeg"):
         programas = [med.ruta("seq-3341-7_seq-3342-5-24bit.wav"), med.ruta("seq-3341-2011-8_seq-3342-6-24bit-v02.wav")]
         contra_ffmpeg(programas + list(args.comparar), inf)
-    elif not args.sin_ffmpeg:
+    else:
         print("(ffmpeg no está en el PATH: se omite la comparación cruzada)")
 
     texto = inf.texto()

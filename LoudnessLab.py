@@ -3,7 +3,8 @@
 Sin argumentos abre la ventana. Con --motor corre el motor de grabación (la ventana lo lanza
 así, en un proceso aparte). Con --asegurar corre el guardián, que retoma una sesión abierta cuyo
 motor no está corriendo (lo usa la tarea programada de Windows). Con --capa verifica una sesión
-contra su audio y genera su capa de frecuencias.
+contra su audio y genera su capa de frecuencias. Con --comparar compara las sesiones terminadas por
+sesión y por servicio (Excel).
 """
 
 import faulthandler
@@ -30,6 +31,9 @@ def main():
     if "--capa" in sys.argv:       # verificar sesiones y generar su capa de frecuencias (en segundo plano)
         from loudness_lab.capa import main as capa
         return capa(sys.argv[1:])
+    if "--comparar" in sys.argv:   # el comparador de sesiones y servicios
+        from loudness_lab.comparador import main as comparar
+        return comparar(sys.argv[1:])
     if "--asegurar" in sys.argv:   # el guardián (tarea programada de Windows)
         from loudness_lab.guardian import main as guardian
         return guardian()

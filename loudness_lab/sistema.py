@@ -86,6 +86,16 @@ def comando_propio(*args):
     return [str(pyw if pyw.exists() else Path(sys.executable)), str(raiz / "LoudnessLab.py"), *args]
 
 
+def comando_motor(*args):
+    """Como comando_propio, pero empaquetada usa LoudnessLab-motor.exe (el mismo programa con otro nombre), para
+    que en el Administrador de tareas el motor no se confunda con la ventana y no se cierre por error."""
+    if getattr(sys, "frozen", False):
+        motor = Path(sys.executable).with_name("LoudnessLab-motor.exe")
+        if motor.exists():
+            return [str(motor), *args]
+    return comando_propio(*args)
+
+
 def lanzar_desacoplado(cmd):
     """Lanza un proceso que sobrevive al cierre de la ventana que lo lanzó."""
     base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
@@ -181,3 +191,138 @@ def motivo_corte(desde_epoch):
     if arranque and arranque > desde_epoch:
         return "Windows se reinició"
     return "el programa se cerró (una caída o lo cerraron desde el Administrador de tareas)"
+
+
+# ------------------------------------------------------------------------------ avisos de Windows al motor
+WM_DESTROY, WM_CLOSE = 0x0002, 0x0010
+WM_QUERYENDSESSION, WM_ENDSESSION, WM_POWERBROADCAST = 0x0011, 0x0016, 0x0218
+PBT_APMSUSPEND, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC = 0x0004, 0x0007, 0x0012
+_LRESULT = ctypes.c_ssize_t
+_WNDPROC = ctypes.WINFUNCTYPE(_LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", _WNDPROC), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH), ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR)]
+
+
+def _user32():
+    u = ctypes.windll.user32
+    u.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    u.DefWindowProcW.restype = _LRESULT
+    u.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+                                  wintypes.HINSTANCE, wintypes.LPVOID]
+    u.CreateWindowExW.restype = wintypes.HWND
+    u.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
+    u.RegisterClassW.restype = wintypes.ATOM
+    u.ShutdownBlockReasonCreate.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    u.ShutdownBlockReasonDestroy.argtypes = [wintypes.HWND]
+    u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    u.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    u.SendMessageW.restype = _LRESULT
+    u.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    u.DestroyWindow.argtypes = [wintypes.HWND]
+    return u
+
+
+class VigiaWindows:
+    """Una ventana oculta, en su propio hilo, para que el motor (que no tiene ventana) reciba los avisos de
+    Windows:
+      - apagado, reinicio o cierre de sesión: si `bloquear()`, Windows muestra `motivo()` en su pantalla de
+        apagado («Loudness Lab está grabando…») y deja elegir entre cancelar o apagar de todos modos; si se
+        apaga, llama a `al_apagar()` y espera a que vuelva (el motor cierra limpio: el corte queda con la hora
+        exacta) antes de dejar que Windows siga;
+      - suspensión y vuelta: `al_suspender()` y `al_despertar()` (el motor anota el tramo como un corte)."""
+
+    CLASE = "LoudnessLabVigia"
+
+    def __init__(self, motivo, al_apagar, al_suspender=None, al_despertar=None, bloquear=lambda: True):
+        import threading
+        self.motivo, self.al_apagar, self.bloquear = motivo, al_apagar, bloquear
+        self.al_suspender, self.al_despertar = al_suspender, al_despertar
+        self.hwnd = None
+        self.lista = threading.Event()
+        self.hilo = threading.Thread(target=self._correr, daemon=True, name="vigia-windows")
+
+    def iniciar(self, espera_s=3.0):
+        self.hilo.start()
+        self.lista.wait(espera_s)
+        return bool(self.hwnd)
+
+    def _proc(self, hwnd, msg, wp, lp):
+        u = self._u
+        try:
+            if msg == WM_QUERYENDSESSION:
+                if self.bloquear():
+                    u.ShutdownBlockReasonCreate(hwnd, self.motivo())
+                    return 0          # FALSE: Windows muestra el motivo y deja «Apagar de todos modos»
+                return 1
+            if msg == WM_ENDSESSION:
+                u.ShutdownBlockReasonDestroy(hwnd)
+                if wp:                 # la sesión termina de verdad: cerrar limpio antes de volver
+                    self.al_apagar()
+                return 0
+            if msg == WM_POWERBROADCAST:
+                if wp == PBT_APMSUSPEND and self.al_suspender:
+                    self.al_suspender()
+                elif wp in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND) and self.al_despertar:
+                    self.al_despertar()
+                return 1
+            if msg == WM_DESTROY:
+                u.PostQuitMessage(0)
+                return 0
+        except Exception:
+            pass                       # un error aquí no puede tumbar al motor
+        return u.DefWindowProcW(hwnd, msg, wp, lp)
+
+    def _correr(self):
+        try:
+            self._u = u = _user32()
+            self._wndproc = _WNDPROC(self._proc)      # (se guarda: si se libera, Windows llamaría a la nada)
+            inst = ctypes.windll.kernel32.GetModuleHandleW(None)
+            wc = _WNDCLASSW()
+            wc.lpfnWndProc = self._wndproc
+            wc.hInstance = inst
+            wc.lpszClassName = self.CLASE
+            u.RegisterClassW(ctypes.byref(wc))         # (si ya estaba registrada, CreateWindow igual la encuentra)
+            self.hwnd = u.CreateWindowExW(0, self.CLASE, "Loudness Lab (motor de grabación)", 0, 0, 0, 0, 0,
+                                          None, None, inst, None)
+        finally:
+            self.lista.set()
+        if not self.hwnd:
+            return
+        msg = wintypes.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+
+    def detener(self):
+        if self.hwnd:
+            self._u.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+            self.hilo.join(2)
+
+
+def notificar(titulo, texto):
+    """Una notificación de Windows (aparece aunque la ventana de Loudness Lab esté cerrada). La muestra
+    PowerShell con las notificaciones de Windows, sin abrir ninguna ventana y sin esperar."""
+    import base64
+    from xml.sax.saxutils import escape
+    xml = (f"<toast><visual><binding template='ToastGeneric'><text>{escape(titulo)}</text>"
+           f"<text>{escape(texto)}</text></binding></visual></toast>")
+    ps = ("[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]"
+          " > $null; [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime]"
+          " > $null; $x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml(\"" + xml.replace('"', "'") + "\");"
+          " [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+          "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe')"
+          ".Show([Windows.UI.Notifications.ToastNotification]::new($x))")
+    try:
+        subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                          base64.b64encode(ps.encode("utf-16-le")).decode()],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=CREATE_NO_WINDOW)
+        return True
+    except OSError:
+        return False

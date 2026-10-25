@@ -37,7 +37,7 @@ def asegurar():
         log.info("Guardián: la sesión «%s» está abierta y su motor no corre; se retoma.", ab["carpeta"])
     except OSError:
         pass
-    sistema.lanzar_desacoplado(sistema.comando_propio("--motor", "--continuar", ab["carpeta"]))
+    sistema.lanzar_desacoplado(sistema.comando_motor("--motor", "--continuar", ab["carpeta"]))
     return ab["carpeta"]
 
 

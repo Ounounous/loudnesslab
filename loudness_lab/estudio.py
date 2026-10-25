@@ -183,6 +183,32 @@ def intervalos(canciones, cambios):
             "percibido_desv": ic(per, _desv)}
 
 
+TECHO_BLOQUES = 50      # bloques amontonados bajo el máximo para decir que la cadena tiene techo
+
+
+def techo_cadena(sp, canciones=()):
+    """S10: si los picos de muestra de la sesión nunca llegan a 0 dBFS y se amontonan justo bajo su máximo (más de
+    50 bloques a 0,1 dB de él), algo en la cadena los limita: un volumen bajo 100 % o un limitador. `sp`: pico de
+    muestra lineal por bloque. Devuelve {dbfs, bloques, canciones (las que llegan al techo)} o None."""
+    sp = np.asarray(sp, dtype=float)
+    if not len(sp) or not sp.max() > 0:
+        return None
+    techo = 20 * math.log10(sp.max())
+    if techo > -0.05:
+        return None
+    n = int(np.sum(sp >= sp.max() * 10 ** (-0.1 / 20)))
+    if n <= TECHO_BLOQUES:
+        return None
+    k = sum(1 for p in canciones if not _nan(p.get("sp")) and p["sp"] >= techo - 0.1)
+    return {"dbfs": round(techo, 2), "bloques": n, "canciones": k}
+
+
+def en_techo(p, techo):
+    """La canción llega al techo de la cadena: su true peak real no se puede medir (la fuente llegaba a escala
+    completa, así que es al menos 0 dBTP)."""
+    return techo is not None and not _nan(p.get("sp")) and p["sp"] >= techo - 0.1
+
+
 def metricas_cambios(V, TV, med):
     """Las métricas de S4 en una sesión, con las definiciones de agregado_servicio: ΔI y salto de cuerpo
     en todos los cambios válidos; subida de arranque y silencio sin los cortes inciertos (dependen de
@@ -288,6 +314,32 @@ def agregado_servicio(servicio, datos):
         "pct_stmax_5": pct(np.array(stmax) > 5), "pct_borde_3": pct(np.abs(sb) > 3),
         "pct_tp_0": pct(tp > 0), "pct_tp_m1": pct(tp > -1), "lra_mediana": float(np.median(lr)) if len(lr) else math.nan,
     }
+
+
+def sonoridad_servicio(datos):
+    """La sonoridad percibida de un servicio (S7), como agregado_servicio: cada canción cuenta una vez (promedio
+    de sus reproducciones válidas con sonoridad). Su LUFS percibido, relativo a la mediana de percibido de su
+    sesión, y su LUFS, relativo a la mediana de LUFS de esas mismas canciones: si desv_percibido es mayor que
+    desv_lufs_con_sonoridad, a igual LUFS las canciones del servicio suenan distinto."""
+    per, lu, lns = collections.defaultdict(list), collections.defaultdict(list), []
+    for _, Q, _ in datos:
+        V = [q for q in Q if q["valida"] and not _nan(q.get("lufs_percibido"))]
+        if not V:
+            continue
+        mp = np.median([q["lufs_percibido"] for q in V])
+        ml = np.median([q["lufs"] for q in V])
+        for q in V:
+            k = clave(q)
+            per[k].append(q["lufs_percibido"] - mp)
+            lu[k].append(q["lufs"] - ml)
+            lns.append(q["ln"])
+    p = np.array([np.mean(v) for v in per.values()])
+    lufs = np.array([np.mean(lu[k]) for k in per])
+    if len(p) < 2:
+        return {"canciones_con_sonoridad": int(len(p))}
+    return {"canciones_con_sonoridad": int(len(p)), "desv_lufs_con_sonoridad": float(lufs.std(ddof=1)),
+            "desv_percibido": float(p.std(ddof=1)), "desv_percibido_ic": ic(p, _desv),
+            "ln_mediana": float(np.median(lns))}
 
 
 def emparejar(por_servicio, a, b):

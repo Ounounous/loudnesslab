@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import zipfile
 
@@ -151,9 +152,9 @@ def main():
         chequeo("las de medios de más suenan más de lo que dice su LUFS",
                 min(p["desajuste_db"] for p in medios) > 0 > max(p["desajuste_db"] for p in graves),
                 f"(medios {[round(p['desajuste_db'], 1) for p in medios]}, graves {[round(p['desajuste_db'], 1) for p in graves]})")
-        chequeo("panel con barras y texto del promedio", panel.lbl_falta.isHidden() and panel.b_capa.isHidden()
+        chequeo("panel con bloques y texto del promedio", panel.lbl_falta.isHidden() and panel.b_capa.isHidden()
                 and f"Promedio de las {len(validas)} canciones válidas" in panel.lbl.text()
-                and np.ptp(panel.barras.opts["height"]) > 0, repr(panel.lbl.text()[:80]))
+                and panel.nivel.max() > 0 and np.array_equal(panel.pico, panel.nivel), repr(panel.lbl.text()[:80]))
         fila = vivo.tabla.item(0, 10).text(), vivo.tabla.item(0, 11).text()
         chequeo("columnas Graves y Desaj. con valores", fila[0].endswith("%") and fila[1] not in ("—", ""), str(fila))
 
@@ -259,6 +260,54 @@ def main():
         vivo._clic_grafico(Clic(medio[0], doble=True))
         chequeo("doble clic: vuelve a la vista de siempre", not vivo.manual)
 
+        print("3e. Comparar sesiones (diálogo)")
+        dc = ventana.DialogoComparar(None, d)
+        chequeo("lista la sesión terminada, marcada", dc.tabla.rowCount() == 1 and dc.elegidas() == [c])
+        ruta_cmp = os.path.join(d, "comparacion.xlsx")
+
+        class DialogoArchivoFalso:
+            @staticmethod
+            def getSaveFileName(*a, **k):
+                return ruta_cmp, ""
+
+        class TareaYa:      # la tarea en el mismo hilo (en la app corre aparte)
+            def __init__(self, fn, *a):
+                self.fn, self.a = fn, a
+
+            def iniciar(self, listo, fallo=None):
+                listo(self.fn(*self.a))
+
+        guardados = ventana.QFileDialog, ventana.Tarea
+        ventana.QFileDialog, ventana.Tarea = DialogoArchivoFalso, TareaYa
+        try:
+            dc._comparar()
+        finally:
+            ventana.QFileDialog, ventana.Tarea = guardados
+        chequeo("compara, guarda el Excel y muestra el resumen del servicio", os.path.exists(ruta_cmp)
+                and dc.resultado.rowCount() == 1 and dc.resultado.item(0, 0).text() == "Otro"
+                and "Listo: 1 sesión comparada" in dc.lbl_avance.text(), dc.lbl_avance.text()[:60])
+        chequeo("con la sonoridad percibida del servicio", "(" in dc.resultado.item(0, 7).text(),
+                dc.resultado.item(0, 7).text())
+
+        print("3f. Techo de la cadena (S10)")
+        from loudness_lab import estudio
+        rng = np.random.default_rng(2)
+        sp = rng.uniform(0.01, 0.9, 20000)
+        tope = 10 ** (-0.11 / 20)
+        con_techo = np.r_[sp, np.full(80, tope)]
+        chequeo("picos amontonados bajo 0 dBFS: hay techo", (estudio.techo_cadena(con_techo) or {}).get("dbfs") == -0.11)
+        chequeo("pocos bloques en el máximo: no", estudio.techo_cadena(np.r_[sp, np.full(20, tope)]) is None)
+        chequeo("si los picos llegan a 0 dBFS: no", estudio.techo_cadena(np.r_[con_techo, [1.0]]) is None)
+        p_max = max(snap["pistas"], key=lambda q: q["sp"])
+        st_t = {**snap["estado"]["sesion"], "techo_cadena": {"dbfs": round(p_max["sp"], 2), "bloques": 99, "canciones": 1}}
+        vivo._poner_stats(st_t)
+        fila_t = len(vivo.pistas) - 1 - vivo.pistas.index(next(q for q in vivo.pistas if q["sp"] == p_max["sp"]))
+        chequeo("la ventana avisa y muestra «≥ 0» en la canción que llega al techo",
+                "la cadena no deja pasar" in vivo.stats["tp"].text() and vivo.tabla.item(fila_t, 5).text() == "≥ 0",
+                vivo.stats["tp"].text())
+        vivo._poner_stats(snap["estado"]["sesion"])
+        chequeo("sin techo, vuelve a su valor", vivo.tabla.item(fila_t, 5).text() == ventana.num(p_max["tp"]))
+
         print("4. En vivo: canción en curso y pausa")
         e = np.mean([p["espectro"] for p in con], axis=0)
         vivo.actualizar({"grabando": True, "frecuencias": {"bandas_3s": list(e), "cancion": bandas.espectro_cancion(
@@ -271,7 +320,34 @@ def main():
         chequeo("en vivo: sonoridad de la canción y la de ahora", "LN 71,7 phon = −16,2 LUFS percibidos (su LUFS: −14,0)"
                 in panel.lbl.text() and "Ahora: LN 70,1 phon" in panel.lbl.text(), repr(panel.lbl.text()[-90:]))
         vivo.actualizar({"grabando": True, "pausado": True, "frecuencias": {"bandas_3s": list(e)}})
-        chequeo("en pausa no muestra barras", "En pausa" in panel.lbl.text() and not np.any(panel.barras.opts["height"]))
+        chequeo("en pausa no muestra bloques", "En pausa" in panel.lbl.text() and not panel.nivel.any()
+                and not panel.pico.any())
+
+        print("4b. Visor de segmentos: el rastro del pico cae lento")
+        reloj = [100.0]
+        panel._ahora = lambda: reloj[0]
+        fuerte = np.full(bandas.N_BANDAS, 10 ** (-12 / 10))     # −12 dB: 23,2 de 24 segmentos
+        suave = np.full(bandas.N_BANDAS, 10 ** (-52 / 10))      # −52 dB: 7,2
+        panel.mostrar(fuerte, "x")
+        chequeo("−12 dB: la barra llega a 23,2 de 24 segmentos", abs(panel.nivel[0] - 23.2) < 1e-9
+                and panel.pico[0] == panel.nivel[0])
+        panel.mostrar(suave, "x")
+        chequeo("al bajar, la barra baja al tiro y el rastro del pico se queda arriba", abs(panel.nivel[0] - 7.2) < 1e-9
+                and abs(panel.pico[0] - 23.2) < 1e-9 and panel.timer_pico.isActive())
+        reloj[0] += 0.3
+        panel._animar_picos()
+        quieto = abs(panel.pico[0] - 23.2) < 1e-9
+        reloj[0] += 0.5
+        panel._animar_picos()
+        medio = panel.pico[0]
+        reloj[0] += 2.0
+        panel._animar_picos()
+        chequeo("el rastro espera un momento, cae lento y termina en el nivel nuevo", quieto and 7.2 < medio < 23.2
+                and abs(panel.pico[0] - 7.2) < 1e-9 and not panel.timer_pico.isActive(), f"(a los 0,8 s va en {medio:.1f})")
+        panel.mostrar(fuerte, "x")
+        chequeo("al subir, el pico sube con la barra", abs(panel.pico[0] - 23.2) < 1e-9)
+        panel._ahora = time.monotonic
+        panel.limpiar()
         vivo.actualizar({"grabando": True})
         chequeo("grabación retomada sin capa en vivo", "no mide la capa" in panel.lbl_falta.text())
 
