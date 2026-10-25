@@ -82,6 +82,16 @@ def main():
     chequeo("N5 de la canción sale de los segundos con música", c1 is not None
             and abs(c1["n5"] - np.percentile(junta.n[:30], 95)) < 1e-9, f"({c1 and round(c1['n5'], 2)} sone)")
     chequeo("una canción de menos de 10 s de música no tiene sonoridad", junta.cancion(0, 90, st) is None)
+    graves = np.ones(29)
+    graves[:8] *= 30
+    d40, d60, d80 = (bandas.espectro_cancion(graves[None, :], [0.0], phon=ph)["desajuste_db"] for ph in (40, 60, 80))
+    chequeo("índice rápido: con graves de más, cuanto más bajo el volumen, más se nota", d40 < d60 < d80 < 0,
+            f"({d40:.1f} / {d60:.1f} / {d80:.1f} dB a 40 / 60 / 80 phon)")
+    p = sonoridad.parametros({"sonoridad": {"nivel_escucha_db_spl": 55, "phon_indice": 50}}, {"nivel_escucha_db_spl": 70})
+    q = sonoridad.parametros({}, {"nivel_escucha_db_spl": 70}, phon=40)
+    chequeo("parámetros: lo pedido, después la sesión, la configuración y los de siempre",
+            (p["nivel"], p["phon"]) == (55, 50) and (q["nivel"], q["phon"]) == (70, 40)
+            and sonoridad.parametros({}) == {"nivel": 65.0, "campo": "libre", "phon": 60.0})
     print("\nTODO BIEN" if not fallas else f"\nHAY FALLAS: {fallas}")
     return 1 if fallas else 0
 

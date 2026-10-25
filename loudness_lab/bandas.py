@@ -25,7 +25,7 @@ NOMINALES = [25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 6
              1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000]
 BORDE = 10.0 ** (1.0 / 20.0)                      # bordes de banda: fc / BORDE … fc * BORDE
 N_BANDAS = len(FC)                                # 29
-PHON_ESCUCHA = 60.0                               # nivel de música de fondo para el desajuste
+PHON_ESCUCHA = 60.0                               # nivel de música de fondo para el desajuste (por defecto)
 
 REGIONES = {
     "graves": (25, 200),         # LUFS los cuenta casi completos; el oído, a volumen bajo, casi no
@@ -142,9 +142,10 @@ def reparto_regiones(energia_bandas):
     return {k: float(100 * e[(nom >= a) & (nom <= b)].sum() / tot) for k, (a, b) in REGIONES.items()}
 
 
-def espectro_cancion(filas, st, silencio=-60.0, sr=48000):
+def espectro_cancion(filas, st, silencio=-60.0, sr=48000, phon=PHON_ESCUCHA):
     """El espectro de una canción: promedio de sus filas de bandas en los bloques con música (short-term
-    sobre −60 LUFS), su reparto y su desajuste. None si no hay bloques con música."""
+    sobre −60 LUFS), su reparto y su desajuste (al nivel de escucha `phon`). None si no hay bloques con
+    música."""
     filas = np.asarray(filas, dtype=np.float64)
     st = np.asarray(st, dtype=float)
     if not len(filas) or len(filas) != len(st):
@@ -154,7 +155,7 @@ def espectro_cancion(filas, st, silencio=-60.0, sr=48000):
         return None
     e = filas[m].mean(axis=0)
     return {"espectro": [float(v) for v in e], "reparto": reparto_regiones(e),
-            "desajuste_db": float(desajuste_lufs_oido(e, sr=sr))}
+            "desajuste_db": float(desajuste_lufs_oido(e, phon=phon, sr=sr))}
 
 
 def ruido_rosa(n, sr, semilla=1):

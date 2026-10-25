@@ -181,6 +181,84 @@ def main():
         chequeo("y se puede ocultar", not vivo.percibidos.isVisible())
         vivo.chk_percibido.setChecked(True)
 
+        print("3c. Recalcular la sesión a otro nivel de escucha, y guardarlo")
+        chequeo("se abre con los niveles por defecto", s3["nivel_escucha_db_spl"] == 65 and s3["phon_indice"] == 60
+                and not vivo.panel_frec.fila_niveles.isHidden() and "guardados en la sesión" in panel.lbl_niveles.text())
+        snap40 = sesiones.reconstruir(c, 40, 45)
+        vivo.limpiar()
+        vivo.mostrar_sesion(snap40)
+        a, b = snap["pistas"], snap40["pistas"]
+        chequeo("a 40 dB SPL / 45 phon: mismos LUFS, otra percepción",
+                [p["lufs"] for p in a] == [p["lufs"] for p in b]
+                and all(abs(p["lufs_percibido"] - q["lufs_percibido"]) > 0.05 for p, q in zip(a, b))
+                and any(abs(p["desajuste_db"] - q["desajuste_db"]) > 0.1 for p, q in zip(a, b)))
+        graves_40 = [q["lufs_percibido"] - q["lufs"] for q in b if q["reparto"]["graves"] > 50]
+        graves_65 = [p["lufs_percibido"] - p["lufs"] for p in a if p["reparto"]["graves"] > 50]
+        chequeo("a menor nivel, los graves pesan menos en lo percibido", max(graves_40) < min(graves_65),
+                f"(percibido − LUFS: {[round(x, 1) for x in graves_65]} a 65 → {[round(x, 1) for x in graves_40]} a 40)")
+        chequeo("la vista avisa que está recalculada", "Vista recalculada a 40 dB SPL y 45 phon" in panel.lbl_niveles.text()
+                and panel.sp_nivel.value() == 40 and "(45 phon)" in panel.leyenda.text(), panel.lbl_niveles.text())
+        cambios = sesiones.guardar_sonoridad(c, 40, 45)
+        sj = sesiones._json(os.path.join(c, "sesion.json"))
+        snap_g = sesiones.reconstruir(c)
+        chequeo("guardar deja los niveles en la sesión, con registro", cambios == ["nivel", "phon"]
+                and sj["sonoridad"]["nivel_escucha_db_spl"] == 40 and sj["sonoridad"]["phon_indice"] == 45
+                and [e["campo"] for e in sj["ediciones"][-2:]] == ["sonoridad.nivel_escucha_db_spl", "sonoridad.phon_indice"]
+                and snap_g["estado"]["sesion"]["nivel_escucha_db_spl"] == 40
+                and [p["lufs_percibido"] for p in snap_g["pistas"]] == [q["lufs_percibido"] for q in b])
+        vivo.limpiar()
+        vivo.mostrar_sesion(snap_g)
+        chequeo("y al reabrirla son los suyos", "guardados en la sesión" in panel.lbl_niveles.text())
+        sesiones.guardar_sonoridad(c, 65, 60)      # (lo que sigue espera los de siempre)
+        vivo.limpiar()
+        vivo.mostrar_sesion(snap)
+
+        print("3d. Gráfico y tabla: el detalle de cada canción, clic para ir a la tabla, clic en la tabla para el zoom")
+        vivo.resize(1400, 900)
+        vivo.sucio = True
+        vivo.redibujar()
+        n = len(snap["pistas"])
+        medio = [(vivo.x_ini[k] + vivo.x_fin[k]) / 2 for k in range(n)]
+        chequeo("el gráfico ya no muestra la ayuda del zoom como tooltip fijo", vivo.plot.toolTip() == "")
+        chequeo("cada instante del gráfico, su canción", [vivo._pista_en(x) for x in medio] == list(range(n))
+                and vivo._pista_en(vivo.x_ini[0] - 5) is None)
+        det = vivo._detalle(3)
+        fila_t = n - 1 - 3
+        chequeo("el detalle trae los mismos datos de la tabla", "Artista 3 – Tema 3" in det and all(
+            ventana._html(vivo.tabla.item(fila_t, k).text()) in det for k in (0, 2, 3, 6, 7, 8, 9, 10, 11))
+            and ventana.AYUDA_GRAFICO in det, det[:90])
+
+        class Clic:
+            def __init__(self, x, doble=False):
+                self.p, self.d = vivo.vista.mapViewToScene(ventana.pg.Point(x, -20)), doble
+
+            def button(self):
+                return ventana.Qt.MouseButton.LeftButton
+
+            def double(self):
+                return self.d
+
+            def scenePos(self):
+                return self.p
+
+        vivo._sobre_grafico(Clic(medio[2]).scenePos())
+        chequeo("pasar el mouse muestra esa canción", vivo._bajo_mouse == 2)
+        vivo._clic_grafico(Clic(medio[1]))
+        sel = vivo.tabla.selectionModel().selectedRows()
+        chequeo("clic en el gráfico: la canción queda elegida en la tabla y marcada",
+                [r.row() for r in sel] == [n - 1 - 1] and vivo.tabla.item(n - 2, 1).text().startswith("Artista 1 – Tema 1")
+                and vivo.resaltado.isVisible() and vivo.resaltado.getRegion() == (vivo.x_ini[1], vivo.x_fin[1]))
+        vivo._fila_elegida(n - 1 - 2)
+        (a, b), _ = vivo.vista.viewRange()
+        chequeo("clic en la tabla: zoom a la canción con la anterior y la siguiente",
+                a <= vivo.x_ini[1] < vivo.x_ini[2] and b >= vivo.x_fin[3] and a > vivo.x_ini[0] and b < vivo.x_fin[4]
+                and vivo.manual and vivo.resaltado.getRegion() == (vivo.x_ini[2], vivo.x_fin[2]))
+        vivo._fila_elegida(n - 1)            # la primera: no tiene anterior
+        (a, b), _ = vivo.vista.viewRange()
+        chequeo("la primera canción: con la siguiente", a <= vivo.x_ini[0] and vivo.x_fin[1] <= b < vivo.x_fin[2])
+        vivo._clic_grafico(Clic(medio[0], doble=True))
+        chequeo("doble clic: vuelve a la vista de siempre", not vivo.manual)
+
         print("4. En vivo: canción en curso y pausa")
         e = np.mean([p["espectro"] for p in con], axis=0)
         vivo.actualizar({"grabando": True, "frecuencias": {"bandas_3s": list(e), "cancion": bandas.espectro_cancion(
@@ -215,7 +293,8 @@ def main():
         chequeo("encabezados de bandas y regiones", "Graves (%)" in hoja5 + textos and "16 kHz" in hoja5 + textos)
         chequeo("fase 3 en el Excel: columnas y promedios", all(t in textos for t in (
             "Salto de cuerpo", "Subida de arranque", "LUFS percibido", "LN (phon)", "N5 (sone)",
-            "Sonoridad percibida: desviación entre canciones (escala LUFS)", "|ΔI| &gt; 3 LU")))
+            "Sonoridad percibida: desviación entre canciones (escala LUFS)", "|ΔI| &gt; 3 LU",
+            "Calculado con nivel de escucha (−14 LUFS =)", "Índice rápido LUFS–oído (ISO 226) a")))
 
         print("6. Diálogo «Frecuencias y archivo»: requisitos y archivar")
         ventana.QMessageBox = CajaFalsa

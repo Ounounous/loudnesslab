@@ -19,7 +19,7 @@ medido con ruido rosa estéreo (calibracion_spl; 79,89 dB a 65 dB SPL).
 import numpy as np
 
 from . import zwicker
-from .bandas import N_BANDAS, BancoTercios, ruido_rosa
+from .bandas import N_BANDAS, PHON_ESCUCHA, BancoTercios, ruido_rosa
 
 LUFS_REF = -14.0
 NIVEL_ESCUCHA = 65.0        # dB SPL de una señal a LUFS_REF en la mesa
@@ -84,10 +84,11 @@ class Sonoridad:
     espectro.f32. `desde`: el primer segundo que se calcula (al retomar una sesión en vivo, los de
     antes no se calculan: la canción que cruza el corte no cuenta)."""
 
-    def __init__(self, leer, nivel=NIVEL_ESCUCHA, campo=CAMPO, desde=0):
+    def __init__(self, leer, nivel=NIVEL_ESCUCHA, campo=CAMPO, desde=0, phon_indice=PHON_ESCUCHA):
         self.leer = leer
         self.nivel = float(nivel)
         self.campo = campo
+        self.phon_indice = float(phon_indice)   # el del índice rápido ISO 226 (desajuste), que va con la sesión
         self.c = c_spl(self.nivel)
         self.desde = int(desde)
         self.n = np.zeros(0)        # segundos [desde, desde + len)
@@ -141,14 +142,23 @@ class Sonoridad:
         return {"metodo": "ISO 532-1:2017 estacionario (Zwicker), un valor por segundo desde espectro.f32; "
                           "algoritmo de MoSQITo 1.2.1",
                 "campo": self.campo, "lufs_ref": LUFS_REF, "nivel_escucha_db_spl": self.nivel,
-                "c_spl_db": round(self.c, 3),
+                "c_spl_db": round(self.c, 3), "phon_indice": self.phon_indice,
                 "por_cancion": "N5 (percentil 95 de N en los segundos con música), mediana de N, LN = phon del N5, "
                                "LUFS percibido = LUFS de un ruido rosa con el mismo LN"}
 
 
-def de_sesion(s, cfg=None):
-    """Nivel de escucha y campo con que se calcula la sonoridad de una sesión: lo que dice su sesion.json
-    (`sonoridad`), o la configuración, o los valores por defecto."""
+def parametros(s, cfg=None, nivel=None, phon=None):
+    """Con qué se calcula la percepción de una sesión: {nivel (dB SPL de −14 LUFS), campo, phon (del índice
+    rápido)}. Manda lo que se pida (`nivel`, `phon`: para ver la sesión a otro nivel), después lo que dice
+    su sesion.json (`sonoridad`), después la configuración y al final los valores por defecto."""
     meta = (s or {}).get("sonoridad") or {}
-    nivel = meta.get("nivel_escucha_db_spl", (cfg or {}).get("nivel_escucha_db_spl", NIVEL_ESCUCHA))
-    return float(nivel or NIVEL_ESCUCHA), meta.get("campo", CAMPO)
+    cfg = cfg or {}
+
+    def elegir(pedido, clave_meta, clave_cfg, defecto):
+        for v in (pedido, meta.get(clave_meta), cfg.get(clave_cfg)):
+            if v not in (None, ""):
+                return float(v)
+        return float(defecto)
+    return {"nivel": elegir(nivel, "nivel_escucha_db_spl", "nivel_escucha_db_spl", NIVEL_ESCUCHA),
+            "campo": meta.get("campo", CAMPO),
+            "phon": elegir(phon, "phon_indice", "phon_indice", PHON_ESCUCHA)}

@@ -263,6 +263,38 @@ def guardar_estudio(carpeta, nuevo, motivo=""):
     return cambios
 
 
+def _percepcion_guardada(s, cfg):
+    from . import sonoridad
+    return sonoridad.parametros(s, cfg)
+
+
+def guardar_sonoridad(carpeta, nivel, phon, motivo=""):
+    """Guarda en sesion.json (`sonoridad`) el nivel de escucha y el índice rápido con que se calcula la
+    percepción de la sesión, y deja registro del cambio en `ediciones`. Devuelve lo que cambió."""
+    from . import sonoridad
+    if not editable(carpeta):
+        raise RuntimeError("La sesión está grabando (o quedó abierta): sus datos se corrigen cuando termine.")
+    s = _json(os.path.join(carpeta, "sesion.json"))
+    if s is None:
+        raise ValueError(f"«{carpeta}» no es una sesión: falta sesion.json.")
+    cfg = _config_de(s, carpeta)
+    antes = sonoridad.parametros(s, cfg)
+    despues = {"nivel": float(nivel), "phon": float(phon)}
+    cambios = [k for k in despues if despues[k] != antes[k]]
+    meta = dict(s.get("sonoridad") or {})
+    if not cambios and meta:
+        return []
+    base = sonoridad.Sonoridad(None, despues["nivel"], antes["campo"], phon_indice=despues["phon"]).metadatos()
+    s["sonoridad"] = {**meta, **base}
+    hora = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    nombres = {"nivel": "sonoridad.nivel_escucha_db_spl", "phon": "sonoridad.phon_indice"}
+    s.setdefault("ediciones", []).extend(
+        {"campo": nombres[k], "antes": antes[k], "despues": despues[k], "hora": hora,
+         **({"motivo": motivo} if motivo else {})} for k in cambios)
+    _escribir_sesion(carpeta, s)
+    return cambios
+
+
 def importar_catalogo(base, catalogo, sobrescribir=False):
     """Carga en cada sesión de `base` lo que dice el catálogo del estudio (catalogo_sesiones.json).
     No toca las que ya tienen datos del estudio (salvo `sobrescribir`) ni las que están grabando.
@@ -295,10 +327,11 @@ def nivel_aplica(cfg):
         and not (cfg.get("stream_url") or "").strip()
 
 
-def repasar(carpeta, s, cfg, tramos=None, **opciones):
+def repasar(carpeta, s, cfg, tramos=None, nivel=None, phon=None, **opciones):
     """Pasa mediciones.f32 y pistas.csv por un Seguidor nuevo, en el orden en que ocurrieron: queda
     como estaba el de la grabación en ese punto. `tramos`: los excluidos (por defecto, los del estudio
-    de la sesión). Devuelve (seguidor, eventos, bloques)."""
+    de la sesión). `nivel` y `phon`: para calcular la percepción a otro nivel de escucha que el de la
+    sesión (ver sonoridad.parametros). Devuelve (seguidor, eventos, bloques)."""
     sr, ch = int(s.get("sample_rate") or 48000), int(s.get("canales") or 2)
     blk = sr // 10
     if tramos is None:
@@ -310,9 +343,9 @@ def repasar(carpeta, s, cfg, tramos=None, **opciones):
     if n_med and capa.filas_espectro(carpeta) >= n_med:   # con la capa de frecuencias completa
         bandas_de = lambda a, b: capa.leer_espectro(carpeta, a, b)  # noqa: E731
         from . import sonoridad
-        nivel, campo = sonoridad.de_sesion(s, cfg)
+        p = sonoridad.parametros(s, cfg, nivel, phon)
         # toda la sesión de una vez (por lotes es ~50 veces más rápido que canción por canción)
-        son = sonoridad.Sonoridad(bandas_de, nivel, campo).hasta(n_med // 10)
+        son = sonoridad.Sonoridad(bandas_de, p["nivel"], p["campo"], phon_indice=p["phon"]).hasta(n_med // 10)
     seg = Seguidor(min_dur=float(cfg.get("min_dur") or 30), refinar_s=3.0,
                    umbral_salto=float(cfg.get("umbral_salto") or 3.0), tramos=tramos,
                    nivel_aplica=nivel_aplica(cfg), bandas_de=bandas_de, sr=sr, sonoridad=son, **opciones)
@@ -338,15 +371,16 @@ def repasar(carpeta, s, cfg, tramos=None, **opciones):
     return seg, eventos, n
 
 
-def reconstruir(carpeta):
+def reconstruir(carpeta, nivel=None, phon=None):
     """Lo que la ventana recibe de un motor al conectarse (un «snapshot»), armado desde los archivos
-    de una sesión que ya no graba."""
+    de una sesión que ya no graba. `nivel` y `phon`: la percepción a otro nivel de escucha que el que
+    la sesión tiene guardado (no cambia la sesión; para eso, guardar_sonoridad)."""
     s = _json(os.path.join(carpeta, "sesion.json"))
     if s is None:
         raise ValueError(f"«{carpeta}» no es una sesión: falta sesion.json.")
     cfg = _config_de(s, carpeta)
     sr = int(s.get("sample_rate") or 48000)
-    seg, eventos, n = repasar(carpeta, s, cfg)
+    seg, eventos, n = repasar(carpeta, s, cfg, nivel=nivel, phon=phon)
     seg.terminar()
 
     idx = np.arange(9, n, 10)   # un punto por segundo, como en vivo
@@ -361,6 +395,7 @@ def reconstruir(carpeta):
     terminada = bool(s.get("fin_pc"))
     return {
         "tipo": "snapshot", "version": VERSION, "config": cfg, "carpeta": carpeta, "inicio_epoch": inicio,
+        "percepcion_guardada": _percepcion_guardada(s, cfg),
         "log": _log(carpeta), "pistas": list(seg.cerradas), "pausas": pausas,
         "curva_t": (idx + 1) / 10.0, "curva_st": seg.st.v[idx],
         "estado": {"tipo": "estado", "grabando": False, "segundos": n / 10, "inicio_epoch": inicio,

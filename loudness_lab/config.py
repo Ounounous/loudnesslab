@@ -92,6 +92,7 @@ class Config:
     alerta_silencio_min: float = 2.0
     min_dur: float = 30.0
     nivel_escucha_db_spl: float = 65.0   # sonoridad percibida: una señal a −14 LUFS suena a esto en la mesa
+    phon_indice: float = 60.0            # índice rápido LUFS–oído (ISO 226): nivel de escucha en phon
     checklist: dict = field(default_factory=dict)
     # la sesión con la que se abre la app (carpeta); no es parte de lo que se graba
     ultima_sesion: str = ""

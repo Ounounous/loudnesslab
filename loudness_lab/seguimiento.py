@@ -222,7 +222,8 @@ class Seguidor:
         p.update(estudio.medir_cancion(p, self.st.v, self.mom.v))
         if self.bandas_de is not None and b > a:
             from .bandas import espectro_cancion
-            esp = espectro_cancion(self.bandas_de(a, b), self.st.v[a:b], sr=self.sr)
+            esp = espectro_cancion(self.bandas_de(a, b), self.st.v[a:b], sr=self.sr,
+                                   **({"phon": self.sonoridad.phon_indice} if self.sonoridad is not None else {}))
             if esp:
                 p.update(esp)
         if self.sonoridad is not None and b > a:
@@ -347,4 +348,6 @@ class Seguidor:
             "tp_max": float(db(self.tp_max)) if self.n else NAN,
             **estudio.metricas_cambios(V, TV, med),
             **estudio.metricas_sonoridad(V),
+            "nivel_escucha_db_spl": self.sonoridad.nivel if self.sonoridad is not None else NAN,
+            "phon_indice": self.sonoridad.phon_indice if self.sonoridad is not None else NAN,
         }

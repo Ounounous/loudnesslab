@@ -5,6 +5,7 @@ muestra lo que el motor publica. Por eso se puede cerrar sin cortar la grabació
 abrirla, se reconecta.
 """
 
+import bisect
 import datetime as dt
 import json
 import math
@@ -17,12 +18,12 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                               QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
+                               QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QPushButton, QRadioButton, QScrollArea, QSlider, QSplitter, QTableWidget,
-                               QProgressBar, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget)
+                               QProgressBar, QTableWidgetItem, QTabWidget, QToolButton, QToolTip, QVBoxLayout, QWidget)
 
 import pyqtgraph as pg
 
@@ -229,11 +230,14 @@ def _texto_reparto(esp, con_desajuste=True):
 
 class PanelFrecuencias(QGroupBox):
     """La capa de frecuencias: energía por tercio de octava, con lo que suma LUFS (filtro K) y lo que oye
-    el oído a volumen de música de fondo (ISO 226, 60 phon). En vivo, los últimos 3 s y la canción en
-    curso; en una sesión guardada, el promedio de sus canciones válidas. Si la sesión no tiene la capa,
-    lo dice y ofrece generarla."""
+    el oído al nivel de escucha del índice rápido (ISO 226, 60 phon por defecto). En vivo, los últimos 3 s
+    y la canción en curso; en una sesión guardada, el promedio de sus canciones válidas, con controles para
+    recalcular la percepción a otro nivel de escucha (y guardarlo en la sesión). Si la sesión no tiene la
+    capa, lo dice y ofrece generarla."""
 
     pedir_capa = Signal()
+    recalcular = Signal(float, float)     # (dB SPL de −14 LUFS, phon del índice rápido)
+    guardar = Signal(float, float)
     MARCAS = (31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)
 
     def __init__(self):
@@ -254,14 +258,45 @@ class PanelFrecuencias(QGroupBox):
         self.linea_oido = self.plot.plot(pen=pg.mkPen(VERDE, width=2, style=Qt.PenStyle.DashLine))
         k = bandas.ganancia_k(48000)
         self.rel_k = k - k[bandas.NOMINALES.index(1000)]
-        self.rel_oido = bandas.sensibilidad_oido(bandas.PHON_ESCUCHA)
+        self.phon = bandas.PHON_ESCUCHA
+        self.rel_oido = bandas.sensibilidad_oido(self.phon)
         self.lbl = QLabel("")
         self.lbl.setWordWrap(True)
-        leyenda = QLabel("<span style='color:#9db8dc'>■</span> energía por banda &nbsp; "
-                         "<span style='color:#d1495b'>━</span> lo que suma LUFS (filtro K) &nbsp; "
-                         f"<span style='color:{VERDE}'>┅</span> lo que oye el oído a volumen de fondo (60 phon)")
-        leyenda.setWordWrap(True)
-        leyenda.setStyleSheet(f"color:{GRIS}")
+        self.leyenda = QLabel("")
+        self.leyenda.setWordWrap(True)
+        self.leyenda.setStyleSheet(f"color:{GRIS}")
+        self._poner_leyenda()
+        # recalcular una sesión guardada a otro nivel de escucha
+        self.sp_nivel = QDoubleSpinBox()
+        self.sp_nivel.setRange(40, 95)
+        self.sp_nivel.setDecimals(0)
+        self.sp_nivel.setSuffix(" dB SPL")
+        self.sp_nivel.setToolTip("Sonoridad percibida (Zwicker): a qué nivel suena una canción a −14 LUFS en el lugar "
+                                 "de escucha (dB SPL sin ponderar)")
+        self.sp_phon = QDoubleSpinBox()
+        self.sp_phon.setRange(20, 90)
+        self.sp_phon.setDecimals(0)
+        self.sp_phon.setSuffix(" phon")
+        self.sp_phon.setToolTip("Índice rápido LUFS–oído (ISO 226) y línea verde: nivel de escucha en phon")
+        self.b_recalcular = QPushButton("Recalcular")
+        self.b_recalcular.setToolTip("Vuelve a calcular la sesión con estos niveles, sin cambiarla")
+        self.b_recalcular.clicked.connect(lambda: self.recalcular.emit(self.sp_nivel.value(), self.sp_phon.value()))
+        self.b_guardar = QPushButton("Guardar en la sesión")
+        self.b_guardar.setToolTip("Deja estos niveles como los de la sesión (queda registro del cambio)")
+        self.b_guardar.clicked.connect(lambda: self.guardar.emit(self.sp_nivel.value(), self.sp_phon.value()))
+        self.lbl_niveles = QLabel("")
+        self.lbl_niveles.setWordWrap(True)
+        self.lbl_niveles.setStyleSheet(f"color:{GRIS}")
+        self.fila_niveles = QWidget()
+        fn = QHBoxLayout(self.fila_niveles)
+        fn.setContentsMargins(0, 0, 0, 0)
+        fn.addWidget(QLabel("Calcular a: −14 LUFS ="))
+        fn.addWidget(self.sp_nivel)
+        fn.addWidget(QLabel("· índice rápido a"))
+        fn.addWidget(self.sp_phon)
+        fn.addWidget(self.b_recalcular)
+        fn.addWidget(self.b_guardar)
+        fn.addStretch()
         self.lbl_falta = QLabel("")
         self.lbl_falta.setWordWrap(True)
         self.lbl_falta.setStyleSheet(f"color:{AMARILLO}")
@@ -269,7 +304,9 @@ class PanelFrecuencias(QGroupBox):
         self.b_capa.clicked.connect(self.pedir_capa.emit)
         lado = QVBoxLayout()
         lado.addWidget(self.lbl)
-        lado.addWidget(leyenda)
+        lado.addWidget(self.leyenda)
+        lado.addWidget(self.fila_niveles)
+        lado.addWidget(self.lbl_niveles)
         lado.addWidget(self.lbl_falta)
         lado.addWidget(self.b_capa)
         lado.addStretch()
@@ -278,6 +315,20 @@ class PanelFrecuencias(QGroupBox):
         lay.addLayout(lado, 2)
         self.limpiar()
 
+    def _poner_leyenda(self):
+        self.leyenda.setText("<span style='color:#9db8dc'>■</span> energía por banda &nbsp; "
+                             "<span style='color:#d1495b'>━</span> lo que suma LUFS (filtro K) &nbsp; "
+                             f"<span style='color:{VERDE}'>┅</span> lo que oye el oído a volumen de fondo "
+                             f"({self.phon:g} phon)")
+
+    def poner_phon(self, phon):
+        """El nivel de escucha (phon) de la línea verde: el del índice rápido de la sesión."""
+        if vacio(phon) or float(phon) == self.phon:
+            return
+        self.phon = float(phon)
+        self.rel_oido = bandas.sensibilidad_oido(self.phon)
+        self._poner_leyenda()
+
     def limpiar(self):
         self.barras.setOpts(height=np.zeros(bandas.N_BANDAS))
         self.linea_k.setData([], [])
@@ -285,6 +336,8 @@ class PanelFrecuencias(QGroupBox):
         self.lbl.setText("")
         self.lbl_falta.hide()
         self.b_capa.hide()
+        self.fila_niveles.hide()
+        self.lbl_niveles.hide()
 
     def mostrar(self, energia, texto):
         e = np.asarray(energia, dtype=float)
@@ -307,19 +360,43 @@ class PanelFrecuencias(QGroupBox):
         self.lbl_falta.hide()
         self.b_capa.hide()
 
+    def _mostrar_niveles(self, stats, guardada, carpeta):
+        nivel, phon = stats.get("nivel_escucha_db_spl"), stats.get("phon_indice")
+        if vacio(nivel) or vacio(phon):
+            return
+        self.sp_nivel.setValue(float(nivel))
+        self.sp_phon.setValue(float(phon))
+        self.fila_niveles.show()
+        g = guardada or {}
+        otra = g and (float(g.get("nivel", nivel)) != float(nivel) or float(g.get("phon", phon)) != float(phon))
+        if otra:
+            self.lbl_niveles.setText(f"Vista recalculada a {num(nivel, 0)} dB SPL y {num(phon, 0)} phon; la sesión tiene "
+                                     f"guardados {num(g.get('nivel'), 0)} dB SPL y {num(g.get('phon'), 0)} phon.")
+            self.lbl_niveles.setStyleSheet(f"color:{AMARILLO}")
+        else:
+            self.lbl_niveles.setText("Los niveles guardados en la sesión.")
+            self.lbl_niveles.setStyleSheet(f"color:{GRIS}")
+        self.lbl_niveles.show()
+        self.b_guardar.setEnabled(bool(carpeta) and sesiones.editable(carpeta))
+
     def falta(self, texto, con_boton):
         self.limpiar()
         self.lbl_falta.setText(texto)
         self.lbl_falta.show()
         self.b_capa.setVisible(con_boton)
 
-    def mostrar_sesion(self, canciones, carpeta):
-        """El promedio de las canciones válidas de una sesión guardada, o qué falta para tenerlo."""
+    def mostrar_sesion(self, canciones, carpeta, stats=None, guardada=None):
+        """El promedio de las canciones válidas de una sesión guardada, o qué falta para tenerlo. `stats`:
+        las estadísticas con que se calculó (nivel de escucha y phon); `guardada`: los niveles que la sesión
+        tiene guardados (si son otros, la vista está recalculada y lo dice)."""
+        stats = stats or {}
+        self.poner_phon(stats.get("phon_indice"))
         con = [p for p in canciones
                if p.get("espectro") and p.get("valida", p.get("por_ahora_valida", not p.get("corta")))]
         if con:
             e = np.mean([p["espectro"] for p in con], axis=0)
-            prom = {"reparto": bandas.reparto_regiones(e), "desajuste_db": float(bandas.desajuste_lufs_oido(e))}
+            prom = {"reparto": bandas.reparto_regiones(e),
+                    "desajuste_db": float(bandas.desajuste_lufs_oido(e, phon=self.phon))}
             d = np.array([p["desajuste_db"] for p in con], dtype=float)
             texto = (f"Promedio de las {len(con)} canciones válidas: {_texto_reparto(prom, False)}\n"
                      f"Desajuste LUFS–oído entre canciones: de {num(d.min(), 1, signo=True)} a "
@@ -330,6 +407,7 @@ class PanelFrecuencias(QGroupBox):
                 texto += (f"\nSonoridad percibida (Zwicker) − LUFS: de {num(dif.min(), 1, signo=True)} a "
                           f"{num(dif.max(), 1, signo=True, unidad='LU')} (desv. {num(dif.std(ddof=1), 1)} LU)")
             self.mostrar(e, texto)
+            self._mostrar_niveles(stats, guardada, carpeta)
             return
         s = sesiones._json(os.path.join(carpeta, "sesion.json")) or {} if carpeta else {}
         if s.get("audio_archivado"):
@@ -348,6 +426,7 @@ class PanelFrecuencias(QGroupBox):
 Y_MIN, Y_MAX = -45.0, 0.0     # el rango vertical con que se abre el gráfico
 AYUDA_ZOOM = ("Rueda del mouse: acercar o alejar el tiempo · Ctrl + rueda: acercar o alejar los LUFS\n"
               "Arrastrar: mover el gráfico · Doble clic: restablecer la vista")
+AYUDA_GRAFICO = "Clic: ver la canción en la tabla · Rueda: zoom (Ctrl: LUFS) · Doble clic: restablecer la vista"
 
 
 class VistaTiempo(pg.ViewBox):
@@ -368,6 +447,8 @@ class PestanaVivo(QWidget):
         self.curva_t, self.curva_st = Serie(3600), Serie(3600)
         self.seg_cortes, self.seg_niveles, self.seg_percibidos = [], [], []
         self.pistas = []   # todas las canciones cerradas de la sesión (la tabla muestra solo las últimas 1000)
+        self.x_ini, self.x_fin = [], []   # dónde está cada canción en el gráfico (instante del reloj)
+        self._bajo_mouse = None           # la canción cuyo detalle muestra el tooltip del gráfico
         self.stats_datos = {}
         self.segundos = 0.0
         self.manual = False   # el usuario movió o acercó el gráfico: deja de seguir el rango elegido
@@ -405,7 +486,7 @@ class PestanaVivo(QWidget):
         self.vista.setLimits(yMin=-75, yMax=10, minYRange=3, minXRange=20)
         self.vista.sigRangeChangedManually.connect(self._movido_a_mano)
         self.plot.scene().sigMouseClicked.connect(self._clic_grafico)
-        self.plot.setToolTip(AYUDA_ZOOM)
+        self.plot.scene().sigMouseMoved.connect(self._sobre_grafico)
         self.plot.setLabel("left", "LUFS")
         self.plot.setMinimumHeight(170)
         self.cortes = self.plot.plot(pen=pg.mkPen((140, 140, 140, 110), width=1), connect="pairs")
@@ -416,6 +497,13 @@ class PestanaVivo(QWidget):
         self.percibidos = self.plot.plot(pen=pg.mkPen(COLOR_PERCIBIDO, width=2.2), connect="pairs")
         # la canción en curso: su nivel provisorio, punteado hasta que termine
         self.nivel_actual = self.plot.plot(pen=pg.mkPen("#d1495b", width=2.2, style=Qt.PenStyle.DashLine))
+        # la canción elegida en la tabla (o con un clic en el gráfico)
+        self.resaltado = pg.LinearRegionItem(values=(0, 1), movable=False, brush=pg.mkBrush(250, 204, 21, 55))
+        for borde in self.resaltado.lines:
+            borde.setPen(pg.mkPen((217, 160, 0, 160), width=1))
+        self.resaltado.setZValue(-10)
+        self.resaltado.hide()
+        self.plot.addItem(self.resaltado)
         self.pista_actual = None
         leyenda = QLabel("<span style='color:#4a78b5'>━</span> short-term (3 s) &nbsp; "
                          "<span style='color:#d1495b'>━</span> integrado de cada canción &nbsp; "
@@ -471,6 +559,9 @@ class PestanaVivo(QWidget):
         self.tabla.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tabla.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.tabla.setAlternatingRowColors(True)
+        self.tabla.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tabla.setToolTip("Clic en una canción: se marca en el gráfico, con la anterior y la siguiente")
+        self.tabla.cellClicked.connect(self._fila_elegida)
         hdr = self.tabla.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -604,7 +695,8 @@ class PestanaVivo(QWidget):
         self.bar_st.poner(float("nan"), "—")
         self.pista_actual = None
         self._poner_stats(snap["estado"].get("sesion") or {})
-        self.panel_frec.mostrar_sesion(snap.get("pistas") or [], snap.get("carpeta"))
+        self.panel_frec.mostrar_sesion(snap.get("pistas") or [], snap.get("carpeta"), snap["estado"].get("sesion") or {},
+                                       snap.get("percepcion_guardada"))
         partes = [f"{c['dispositivo'] or '?'}", f"pérdidas {c['perdidas']}"]
         if c["app"]:
             partes.append(f"app {c['app']}")
@@ -622,6 +714,9 @@ class PestanaVivo(QWidget):
         self.curva_st.agregar(snap.get("curva_st", []))
         self.seg_cortes, self.seg_niveles, self.seg_percibidos = [], [], []
         self.pistas = []
+        self.x_ini, self.x_fin = [], []
+        self._bajo_mouse = None
+        self.resaltado.hide()
         self.stats_datos = {}
         self.segundos = float((snap.get("estado") or {}).get("segundos") or 0)
         self.manual = False
@@ -647,6 +742,8 @@ class PestanaVivo(QWidget):
         self.pistas.append(dict(p))
         x0 = float(self._a_reloj(p["inicio_s"], True))
         x1 = x0 + p["duracion_s"]
+        self.x_ini.append(x0)
+        self.x_fin.append(x1)
         self.seg_cortes += [(x0, Y_MIN), (x0, Y_MAX)]
         if not vacio(p["lufs"]):
             self.seg_niveles += [(x0, p["lufs"]), (x1, p["lufs"])]
@@ -656,23 +753,7 @@ class PestanaVivo(QWidget):
 
         self.tabla.insertRow(0)
         corta = p.get("corta")
-        hora = dt.datetime.fromtimestamp(x0).strftime("%H:%M:%S")
-        nombre = f"{p.get('artista') or '?'} – {p.get('titulo') or '?'}"
-        if corta:
-            nombre += "  (corta: no cuenta)"
-        elif p.get("excluida"):
-            nombre += "  (en un tramo excluido: no cuenta)"
-        elif p.get("tras_pausa"):
-            nombre += "  (empezó tras una pausa o un corte)"
-        elif p.get("parcial"):
-            nombre += "  (parcial: no cuenta)"
-        if p.get("corte_incierto"):
-            nombre += "  · corte incierto"
-        valores = [hora, nombre, mmss(p["duracion_s"]), num(p["lufs"]), num(p["lra"]), num(p["tp"]),
-                   num(p["salto"], signo=True), num(p.get("delta_i"), signo=True), num(p.get("salto_cuerpo"), signo=True),
-                   num(p.get("lufs_percibido")), num((p.get("reparto") or {}).get("graves"), 0, unidad="%"),
-                   num(p.get("desajuste_db"), 1, signo=True)]
-        for c, v in enumerate(valores):
+        for c, v in enumerate(self._valores(p, x0)):
             it = QTableWidgetItem(v)
             if c >= 2:
                 it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -696,6 +777,120 @@ class PestanaVivo(QWidget):
             it.setToolTip("Sobre −1 dBTP: riesgo de distorsión")
         if self.tabla.rowCount() > 1000:
             self.tabla.setRowCount(1000)
+
+    @staticmethod
+    def _nota(p):
+        """Por qué una canción no cuenta (o «corte incierto»), como en la tabla."""
+        partes = []
+        if p.get("corta"):
+            partes.append("corta: no cuenta")
+        elif p.get("excluida"):
+            partes.append("en un tramo excluido: no cuenta")
+        elif p.get("tras_pausa"):
+            partes.append("empezó tras una pausa o un corte")
+        elif p.get("parcial"):
+            partes.append("parcial: no cuenta")
+        if p.get("corte_incierto"):
+            partes.append("corte incierto")
+        return " · ".join(partes)
+
+    @staticmethod
+    def _valores(p, x0):
+        """Una canción en las columnas de la tabla (COLUMNAS)."""
+        nombre = f"{p.get('artista') or '?'} – {p.get('titulo') or '?'}"
+        motivo = PestanaVivo._nota({**p, "corte_incierto": False})
+        if motivo:
+            nombre += f"  ({motivo})"
+        if p.get("corte_incierto"):
+            nombre += "  · corte incierto"
+        return [dt.datetime.fromtimestamp(x0).strftime("%H:%M:%S"), nombre, mmss(p["duracion_s"]), num(p["lufs"]),
+                num(p["lra"]), num(p["tp"]), num(p["salto"], signo=True), num(p.get("delta_i"), signo=True),
+                num(p.get("salto_cuerpo"), signo=True), num(p.get("lufs_percibido")),
+                num((p.get("reparto") or {}).get("graves"), 0, unidad="%"), num(p.get("desajuste_db"), 1, signo=True)]
+
+    # ------------------------------------------------------------------ canciones en el gráfico
+    def _pista_en(self, x):
+        """La canción que está en el instante x del gráfico: su índice en self.pistas, «actual» si es la que
+        suena (todavía sin cerrar), o None."""
+        i = bisect.bisect_right(self.x_ini, x) - 1
+        if i >= 0 and x < self.x_fin[i]:
+            return i
+        p = self.pista_actual
+        if p and self.inicio_epoch is not None and x >= float(self._a_reloj(p["inicio_s"], True)):
+            fin = self._a_reloj(self.curva_t.v[-1], False) if len(self.curva_t) else x
+            if x <= fin + 1:
+                return "actual"
+        return None
+
+    def _detalle(self, i):
+        """El detalle de una canción para el tooltip del gráfico: lo mismo que su fila de la tabla."""
+        if i == "actual":
+            p = self.pista_actual
+            x0 = float(self._a_reloj(p["inicio_s"], True))
+            datos = [("Inicio", dt.datetime.fromtimestamp(x0).strftime("%H:%M:%S")), ("Lleva", mmss(p.get("t_s") or 0)),
+                     ("LUFS", num(p.get("lufs"))), ("True peak", num(p.get("tp"))), ("Salto", num(p.get("salto"), signo=True))]
+            titulo = f"{p.get('artista') or '?'} – {p.get('titulo') or '?'}"
+            nota = "sonando ahora: valores provisorios"
+        else:
+            p = self.pistas[i]
+            v = self._valores(p, self.x_ini[i])
+            datos = [(c, v[k]) for k, c in enumerate(COLUMNAS) if k != 1]
+            titulo = f"{p.get('artista') or '?'} – {p.get('titulo') or '?'}"
+            nota = self._nota(p)
+        celdas = "".join(f"<td style='padding:0 6px'><span style='color:{GRIS}'>{_html(c)}</span><br><b>{_html(val)}</b></td>"
+                         for c, val in datos)
+        album = f"<br><span style='color:{GRIS}'>{_html(p.get('album'))}</span>" if p.get("album") else ""
+        nota = f" <span style='color:{GRIS}'>({_html(nota)})</span>" if nota else ""
+        return (f"<b>{_html(titulo)}</b>{nota}{album}<table style='margin-top:4px'><tr>{celdas}</tr></table>"
+                f"<span style='color:{GRIS}; font-size:8pt'>{AYUDA_GRAFICO}</span>")
+
+    def _sobre_grafico(self, pos):
+        if not self.vista.sceneBoundingRect().contains(pos) or not (self.pistas or self.pista_actual):
+            if self._bajo_mouse is not None:
+                QToolTip.hideText()
+                self._bajo_mouse = None
+            return
+        i = self._pista_en(self.vista.mapSceneToView(pos).x())
+        if i is None:
+            if self._bajo_mouse is not None:
+                QToolTip.hideText()
+            self._bajo_mouse = None
+            return
+        if i != self._bajo_mouse or i == "actual":
+            self._bajo_mouse = i
+            QToolTip.showText(QCursor.pos(), self._detalle(i), self.plot)
+
+    def _resaltar(self, i):
+        if i is None or i == "actual":
+            self.resaltado.hide()
+            return
+        self.resaltado.setRegion((self.x_ini[i], self.x_fin[i]))
+        self.resaltado.show()
+
+    def ir_a_tabla(self, i):
+        """Selecciona en la tabla la canción i (la tabla va de la última a la primera, hasta 1000 filas)."""
+        fila = len(self.pistas) - 1 - i
+        if not 0 <= fila < self.tabla.rowCount():
+            return False
+        self.tabla.selectRow(fila)
+        self.tabla.scrollToItem(self.tabla.item(fila, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
+        return True
+
+    def _fila_elegida(self, fila, _col=0):
+        """Clic en la tabla: la canción se marca en el gráfico, que muestra también la anterior y la siguiente."""
+        i = len(self.pistas) - 1 - fila
+        if not 0 <= i < len(self.pistas):
+            return
+        self._resaltar(i)
+        a = self.x_ini[max(0, i - 1)]
+        if i + 1 < len(self.pistas):
+            b = self.x_fin[i + 1]
+        elif self.pista_actual and len(self.curva_t):      # la siguiente es la que suena
+            b = max(self.x_fin[i], float(self._a_reloj(self.curva_t.v[-1], False)))
+        else:
+            b = self.x_fin[i]
+        self.manual = True        # deja de seguir lo último, como con un zoom a mano
+        self.plot.setXRange(a, b, padding=0.03)
 
     def agregar_log(self, linea, nivel="INFO"):
         color = {"WARNING": AMARILLO, "ERROR": ROJO, "CRITICAL": ROJO}.get(nivel)
@@ -797,6 +992,7 @@ class PestanaVivo(QWidget):
         self.bar_mom.poner(e.get("momentary"), sin_medir)
         self.bar_st.poner(e.get("shortterm"), sin_medir)
         frec = e.get("frecuencias")
+        self.panel_frec.poner_phon((e.get("sesion") or {}).get("phon_indice"))
         if pausado:
             self.panel_frec.mostrar([], "En pausa: no se mide.")
         elif frec:
@@ -841,9 +1037,17 @@ class PestanaVivo(QWidget):
         self.manual = True
 
     def _clic_grafico(self, ev):
-        if ev.double() and ev.button() == Qt.MouseButton.LeftButton \
-                and self.vista.sceneBoundingRect().contains(ev.scenePos()):
+        if ev.button() != Qt.MouseButton.LeftButton or not self.vista.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        if ev.double():
             self.restablecer_vista()
+            return
+        i = self._pista_en(self.vista.mapSceneToView(ev.scenePos()).x())
+        self._resaltar(i)
+        if i is None or i == "actual":
+            self.tabla.clearSelection()
+        else:
+            self.ir_a_tabla(i)
 
     def _zoom(self, eje, factor):
         """Acerca (factor < 1) o aleja (factor > 1) un eje, alrededor del centro de lo que se ve."""
@@ -1073,6 +1277,13 @@ class PestanaConfig(QWidget):
         self.nivel_escucha.setValue(cfg.nivel_escucha_db_spl)
         self.nivel_escucha.setToolTip("Para la sonoridad percibida (Zwicker): a qué nivel suena en la mesa una canción "
                                       "a −14 LUFS. Por defecto 65 dB SPL; se ajusta con una medición en la sala.")
+        self.phon_indice = QDoubleSpinBox()
+        self.phon_indice.setRange(20, 90)
+        self.phon_indice.setDecimals(0)
+        self.phon_indice.setSuffix(" phon")
+        self.phon_indice.setValue(cfg.phon_indice)
+        self.phon_indice.setToolTip("Índice rápido LUFS–oído (columna Desaj. y línea verde del panel Frecuencias): "
+                                    "nivel de escucha en phon (ISO 226). Por defecto 60.")
 
         self.monitor_vol = cfg.monitor_vol
         self.monitor = cfg.monitor
@@ -1118,6 +1329,7 @@ class PestanaConfig(QWidget):
         f3.addRow("Avisar si hay silencio por", self.silencio)
         f3.addRow("Duración mínima de una canción", self.min_dur)
         f3.addRow("Nivel de escucha (−14 LUFS =)", self.nivel_escucha)
+        f3.addRow("Índice rápido LUFS–oído a", self.phon_indice)
 
         cuerpo = QWidget()
         lay = QVBoxLayout(cuerpo)
@@ -1144,7 +1356,7 @@ class PestanaConfig(QWidget):
         for w in (self.dispositivo, self.monitor_disp):
             w.currentIndexChanged.connect(self._avisar)
         for w in (self.horas, self.umbral, self.silencio, self.min_dur, self.ajuste_titulo, self.crossfade,
-                  self.volumen_app, self.nivel_escucha):
+                  self.volumen_app, self.nivel_escucha, self.phon_indice):
             w.valueChanged.connect(self._avisar)
         self._cargando = False
 
@@ -1270,7 +1482,8 @@ class PestanaConfig(QWidget):
             monitor_dispositivo=(self.monitor_disp.currentData() if self.monitor_disp.count() else self._monitor_guardado) or "",
             monitor_vol=self.monitor_vol, umbral_salto=self.umbral.value(),
             alerta_silencio_min=self.silencio.value(), min_dur=self.min_dur.value(),
-            nivel_escucha_db_spl=self.nivel_escucha.value(), checklist=self.checklist)
+            nivel_escucha_db_spl=self.nivel_escucha.value(), phon_indice=self.phon_indice.value(),
+            checklist=self.checklist)
 
     def mostrar(self, c):
         """Muestra la configuración de una sesión: la de una grabación en curso (al reconectarse) o la
@@ -1308,6 +1521,7 @@ class PestanaConfig(QWidget):
         self.silencio.setValue(float(c.get("alerta_silencio_min") or self.silencio.value()))
         self.min_dur.setValue(float(c.get("min_dur") or self.min_dur.value()))
         self.nivel_escucha.setValue(float(c.get("nivel_escucha_db_spl") or self.nivel_escucha.value()))
+        self.phon_indice.setValue(float(c.get("phon_indice") or self.phon_indice.value()))
         disp = c.get("dispositivo")
         if disp:
             i = self.dispositivo.findData(disp)
@@ -1970,6 +2184,8 @@ class Ventana(QMainWindow):
 
         self.pestana_vivo = PestanaVivo()
         self.pestana_vivo.panel_frec.pedir_capa.connect(self._pedir_capa)
+        self.pestana_vivo.panel_frec.recalcular.connect(self._recalcular_sesion)
+        self.pestana_vivo.panel_frec.guardar.connect(self._guardar_niveles)
         self.pestana_config = PestanaConfig(self.cfg)
         self.pestana_chequeo = PestanaChequeo(self)
         self.pestana_config.cambio.connect(self.guardar_config)
@@ -2090,6 +2306,29 @@ class Ventana(QMainWindow):
         if self.carpeta_sesion and self.estado_ui in ("viendo", "terminada"):
             DialogoArchivo(self, self.carpeta_sesion).exec()
             self.abrir_sesion(self.carpeta_sesion)
+
+    def _recalcular_sesion(self, nivel, phon):
+        """La sesión que se está viendo, calculada a otro nivel de escucha (sin cambiarla)."""
+        if not self.carpeta_sesion or self.estado_ui not in ("viendo", "terminada"):
+            return
+        self.statusBar().showMessage(f"Recalculando a {nivel:g} dB SPL y {phon:g} phon…")
+        self.b_sesiones.setEnabled(False)
+        carpeta = self.carpeta_sesion
+        Tarea(sesiones.reconstruir, carpeta, nivel, phon).iniciar(
+            self._sesion_abierta, lambda msg: self._abrir_fallo(carpeta, msg, False))
+
+    def _guardar_niveles(self, nivel, phon):
+        carpeta = self.carpeta_sesion
+        if not carpeta or self.estado_ui not in ("viendo", "terminada"):
+            return
+        try:
+            cambios = sesiones.guardar_sonoridad(carpeta, nivel, phon)
+        except Exception as e:
+            QMessageBox.warning(self, "No se guardó", str(e))
+            return
+        self.statusBar().showMessage(f"Guardado en la sesión: {nivel:g} dB SPL y {phon:g} phon" if cambios
+                                     else "La sesión ya tenía esos niveles")
+        self.abrir_sesion(carpeta)
 
     def _validar_condiciones(self, cfg):
         """Fuente, app y lista coherentes (S2). Devuelve (problemas que impiden grabar, avisos)."""

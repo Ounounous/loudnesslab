@@ -530,9 +530,9 @@ class Motor:
             self.seguidor.bandas_de = self._leer_espectro     # (vacía a disco lo pendiente antes de leer)
             # la sonoridad percibida, un valor por segundo (al retomar, repasar ya calculó lo anterior)
             if self.seguidor.sonoridad is None:
-                nivel, campo = sonoridad.de_sesion(self.previa, cfg)
-                self.seguidor.sonoridad = sonoridad.Sonoridad(self._leer_espectro, nivel, campo,
-                                                              desde=-(-self.seguidor.n // 10))
+                p = sonoridad.parametros(self.previa, cfg)
+                self.seguidor.sonoridad = sonoridad.Sonoridad(self._leer_espectro, p["nivel"], p["campo"],
+                                                              desde=-(-self.seguidor.n // 10), phon_indice=p["phon"])
             else:
                 self.seguidor.sonoridad.leer = self._leer_espectro
         else:
@@ -935,7 +935,9 @@ class Motor:
         out = {"bandas_3s": [float(v) for v in np.mean(self.esp_ultimas, axis=0)]}
         if self.esp_cancion[2] >= 10 and not self.pausado:
             e = self.esp_cancion[1] / self.esp_cancion[2]
-            out["cancion"] = espectro_cancion(np.tile(e, (1, 1)), [0.0], sr=self.sr)
+            son = self.seguidor.sonoridad
+            out["cancion"] = espectro_cancion(np.tile(e, (1, 1)), [0.0], sr=self.sr,
+                                              **({"phon": son.phon_indice} if son is not None else {}))
         son = self.seguidor.sonoridad
         if son is not None and not self.pausado:
             try:

@@ -69,6 +69,17 @@ def _num(hoja, fila, col, v, fmt=None):
         hoja.write_number(fila, col, float(v), fmt)
 
 
+def _phon(s):
+    v = (s or {}).get("phon_indice")
+    return bandas.PHON_ESCUCHA if _vacio(v) else float(v)
+
+
+def _nivel(s):
+    from .sonoridad import NIVEL_ESCUCHA
+    v = (s or {}).get("nivel_escucha_db_spl")
+    return NIVEL_ESCUCHA if _vacio(v) else float(v)
+
+
 def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
     """Escribe el libro en `ruta` y devuelve un resumen de lo escrito.
 
@@ -208,6 +219,8 @@ def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
             ("Sonoridad percibida − LUFS: mediana", s.get("dif_percibido_mediana"), "LU", f_s1),
             ("LN (nivel de sonoridad del N5): mediana", s.get("ln_mediana"), "phon", f_1),
             ("LN: desviación entre canciones", s.get("ln_desv"), "phon", f_2),
+            ("Calculado con nivel de escucha (−14 LUFS =)", s.get("nivel_escucha_db_spl"), "dB SPL", f_0),
+            ("Índice rápido LUFS–oído (ISO 226) a", s.get("phon_indice"), "phon", f_0),
         ]
         fila = 1
         for item in filas:
@@ -302,11 +315,12 @@ def exportar(ruta, nombre, inicio_epoch, horas, pistas, stats, curva, registro):
         notas = ["Bandas: energía media por tercio de octava en los bloques con música de la canción, en dB relativos a "
                  "escala completa (sin ponderar).",
                  "Desajuste LUFS–oído: + la canción suena más de lo que dice su LUFS a volumen de música de fondo "
-                 f"({bandas.PHON_ESCUCHA:g} phon, ISO 226); − suena menos. Ruido rosa = 0. Sirve para ordenar canciones, "
+                 f"({_phon(s):g} phon, ISO 226); − suena menos. Ruido rosa = 0. Sirve para ordenar canciones, "
                  "no como valor absoluto.",
                  "Sonoridad percibida: Zwicker (ISO 532-1 estacionario) un valor por segundo; N5 = sonoridad superada el "
                  "5 % del tiempo con música; LN = su nivel de sonoridad; LUFS percibido = el LUFS al que un ruido rosa "
-                 "sonaría igual de fuerte (calibración en sesion.json → sonoridad; por defecto −14 LUFS = 65 dB SPL)."]
+                 "sonaría igual de fuerte (calibración en sesion.json → sonoridad; aquí −14 LUFS = "
+                 f"{_nivel(s):g} dB SPL)."]
         if not con:
             notas.insert(0, "Esta sesión no tiene capa de frecuencias: se genera desde su audio en «Sesiones… → "
                             "Frecuencias y archivo…».")
