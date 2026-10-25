@@ -61,6 +61,7 @@ class BancoTercios:
         self.resto = np.zeros((0, canales))
 
     def procesar(self, x):
+        from .bs1770 import sin_desnormales
         x = np.asarray(x, dtype=np.float64)
         buf = np.vstack([self.resto, x]) if len(self.resto) else x
         usable = (len(buf) // self.blk) * self.blk
@@ -72,6 +73,7 @@ class BancoTercios:
         out = np.empty((nb, N_BANDAS))
         for j, s in enumerate(self.sos):
             y, self.zi[j] = sosfilt(s, xb, axis=0, zi=self.zi[j])
+            sin_desnormales(self.zi[j])      # (con silencio digital, si no, se pone muy lento)
             out[:, j] = (y.reshape(nb, self.blk, -1) ** 2).mean(axis=1).sum(axis=1)
         return out
 

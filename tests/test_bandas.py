@@ -77,6 +77,15 @@ def main():
             abs((k[j50] - o[j50]) - 25.3) < 0.2 and abs((k[j8k] - o[j8k]) - 14.8) < 0.2,
             f"({k[j50] - o[j50]:+.1f} y {k[j8k] - o[j8k]:+.1f} dB)")
     chequeo("desajuste del ruido rosa = 0", abs(bandas.desajuste_lufs_oido(np.ones(bandas.N_BANDAS))) < 1e-9)
+
+    print("5) Silencio digital: los filtros no quedan en números desnormales (que ponen lenta la CPU)")
+    m = MedidorBloques(sr, 2, true_peak=False, bandas=True)
+    m.procesar(np.stack([x[:sr * 3], x[::-1][:sr * 3]], 1))
+    _, _, _, b_sil = m.procesar(np.zeros((sr * 10, 2)))
+    estados = [m.zi] + list(m.banco.zi)
+    limpio = all(np.all((z == 0) | (np.abs(z) >= 1e-30)) for z in estados)
+    chequeo("tras 10 s de silencio, cada estado es 0 o normal (≥ 1e-30)", limpio)
+    chequeo("y el silencio sigue midiendo silencio (bajo −150 dB)", float(b_sil[-50:].max()) < 1e-15)
     print("\nTODO BIEN" if not fallas else f"\nHAY FALLAS: {fallas}")
     return 1 if fallas else 0
 

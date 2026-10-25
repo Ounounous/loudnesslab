@@ -139,6 +139,18 @@ class TruePeak:
         return m
 
 
+PISO_ESTADO = 1e-30
+
+
+def sin_desnormales(zi):
+    """Deja en cero los estados de un filtro IIR más chicos que 1e-30 (−600 dB: no cambian ninguna medición).
+    Con silencio digital, el estado decae hasta los números desnormales y se queda oscilando ahí (4,9e-324),
+    donde la CPU es decenas de veces más lenta: 10 s de silencio llegaban a tardar 15 s en el banco de
+    tercios, y en vivo el motor se atrasaría. Con el estado en cero, el silencio se calcula exacto y rápido."""
+    zi[np.abs(zi) < PISO_ESTADO] = 0.0
+    return zi
+
+
 class MedidorBloques:
     """Convierte audio continuo en mediciones por bloque de 100 ms, con estado entre llamadas.
 
@@ -183,6 +195,7 @@ class MedidorBloques:
         if nb:
             xb = np.asarray(buf[:usable], dtype=np.float64)
             y, self.zi = sosfilt(self.sos, xb, axis=0, zi=self.zi)
+            sin_desnormales(self.zi)
             self.pend_z = np.vstack([self.pend_z, (y.reshape(nb, self.blk, -1) ** 2).mean(axis=1)])
             self.pend_sp = np.concatenate([self.pend_sp, np.abs(xb).reshape(nb, self.blk, -1).max(axis=(1, 2))])
             if self.banco is not None:

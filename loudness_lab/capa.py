@@ -287,6 +287,10 @@ def _prioridad_baja():
     try:
         import ctypes
         k32 = ctypes.windll.kernel32
+        # con los tipos declarados: el «proceso actual» es el identificador −1, que como int de 32 bits
+        # llegaba mal y la llamada fallaba sin avisar (el proceso quedaba en prioridad normal)
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)   # BELOW_NORMAL_PRIORITY_CLASS
     except Exception:
         pass
